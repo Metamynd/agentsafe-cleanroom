@@ -30,8 +30,36 @@ Three roles run as separate processes, which is the whole point of the threat mo
 - `mock-issuer.mjs`, `agent.mjs`, `matrix.mjs` — the hermetic issuer, the
   canonical signer, and the full functional matrix
 - `attack*.mjs`, `binder-unit.mjs`, `unit-currency*.mjs` — the exploit probes
+  (narrative, for a human to read — not exit-code-checked; some deliberately
+  print a `*** ` marker for a KNOWN historical/comparative bad outcome, e.g.
+  `attack3.mjs`'s pre-0.3.3 canonicalization collision check, so grepping
+  their output for `***` is not a valid pass/fail signal)
+- `gate.mjs` — the mechanical, exit-code CI check for the two newest findings,
+  in the same assertion style as `matrix.mjs`
+- `run-gate.sh` — the actual CI entry point: starts the issuer + gateway,
+  runs `matrix.mjs` + `gate.mjs`, tears down, and exits non-zero the moment
+  either suite fails
+- `.github/workflows/gate.yml` — runs `run-gate.sh` daily (and on
+  `workflow_dispatch` / a PR touching the harness) against whatever
+  `gateway/package.json`'s `^0.4.0` / `^0.3.0` ranges currently resolve to
+  on the real npm registry — **not** the committed, pinned
+  `gateway/package-lock.json` snapshot below, which stays frozen at the
+  2026-08-30 findings on purpose
 - `restart-issuer.sh` — kills the issuer by port (never `pkill -f` — see
   Gotchas below)
+
+## The CI gate
+
+```bash
+bash run-gate.sh   # exit 0 only when every check in matrix.mjs AND gate.mjs passes
+```
+
+This is the actual "no release ships without the suite green" mechanism, run daily in
+[`.github/workflows/gate.yml`](.github/workflows/gate.yml) against whatever is currently
+published — it force-deletes `gateway/node_modules` + `package-lock.json` first so a
+committed lockfile can never quietly pin the gate to a stale, already-fixed version forever.
+The committed `gateway/` tree in this repo is left as the original 2026-08-30 snapshot for
+reproducibility; only the CI workflow re-resolves it fresh.
 
 ## The run loop
 

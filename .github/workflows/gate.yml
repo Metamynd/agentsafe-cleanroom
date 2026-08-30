@@ -1,0 +1,50 @@
+name: cleanroom gate
+
+# This is the actual regression gate, not just a script someone might remember to run by
+# hand — the failure mode this harness exists to close. Runs daily against whatever is
+# CURRENTLY resolvable from npm (see the "force fresh resolution" step below — the
+# committed gateway/package-lock.json is a point-in-time snapshot of the 2026-08-30 run and
+# is deliberately left alone; only this workflow's own ephemeral install ignores it), and on
+# demand via workflow_dispatch or a PR touching the harness itself.
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily; a fixed non-zero minute avoids the top-of-hour GitHub Actions pile-up
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "*.mjs"
+      - "gateway/**"
+      - "proxytest/**"
+      - "run-gate.sh"
+      - ".github/workflows/gate.yml"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # The committed gateway/node_modules + package-lock.json are the 2026-08-30 snapshot
+      # (0.4.2 / 0.3.3) — a plain `npm install` respects an existing lockfile and would test
+      # that snapshot FOREVER, defeating the point of a CONTINUOUS gate. Deleting them here,
+      # in this ephemeral CI checkout only, forces npm to re-resolve gateway/package.json's
+      # own `^0.4.0` / `^0.3.0` ranges against whatever is actually latest on the registry
+      # right now. Nothing here is committed back to the repo.
+      - name: Force fresh resolution against the current published versions
+        run: |
+          rm -rf gateway/node_modules gateway/package-lock.json
+          rm -rf proxytest/node_modules proxytest/package-lock.json
+
+      - name: Record what actually got resolved
+        run: |
+          cd gateway && npm install --no-audit --no-fund
+          echo "gateway depends on:"
+          node -p "require('./node_modules/@metamynd/agentsafe-http-gateway/package.json').version"
+          node -p "require('./node_modules/@metamynd/agentsafe-mcp-guard/package.json').version"
+
+      - name: Run the gate (matrix.mjs + gate.mjs against a live mock issuer + gateway)
+        run: bash run-gate.sh

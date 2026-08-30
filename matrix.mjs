@@ -81,3 +81,6 @@ console.log('\n--- E. authorization forgery ---');
 const p=R.filter(x=>x.p).length;
 console.log(`\n===== ${p}/${R.length} passed =====`);
 R.filter(x=>!x.p).forEach(x=>console.log('FAILED:', x.n, '->', x.d));
+// process.exitCode (not process.exit()) — see gate.mjs for why: a still-settling fetch
+// keep-alive socket can make process.exit() crash instead of exiting cleanly on some platforms.
+process.exitCode = p===R.length ? 0 : 1; // CI gate: exit 0 only when every case passed
