@@ -1,0 +1,2 @@
+{ "name":"proxytest4","private":true,"type":"module",
+  "dependencies":{"@metamynd/agentsafe-http-gateway":"^0.4.0","@metamynd/agentsafe-mcp-guard":"^0.3.0"} }

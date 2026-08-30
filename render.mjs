@@ -1,0 +1,10 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+const src = readFileSync('ext/new/create-metamynd-agent-0.7.7/index.mjs','utf8');
+const consts = ['MCP_GUARD_PKG','GATEWAY_PKG'].map(n=>src.match(new RegExp(`^const ${n} = .*$`,'m'))[0]).join('\n');
+const start = src.indexOf('function gatewayServerFile');
+const end = src.indexOf('\n`;\n}\n', start) + '\n`;\n}\n'.length;
+const fn = src.slice(start, end);
+writeFileSync('/tmp/gwrender.mjs', consts+'\n'+fn+'\nexport default gatewayServerFile;');
+const { default: f } = await import('/tmp/gwrender.mjs');
+writeFileSync('gateway/server.mjs', f('book-flight', 4401, 'http://127.0.0.1:4402'));
+console.log('rendered', f('',4401,'x').length, 'bytes');

@@ -1,0 +1,11 @@
+{
+  "name": "cleanroom4-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": {
+    "@metamynd/agentsafe-mcp-guard": "^0.3.0",
+    "@metamynd/agentsafe-http-gateway": "^0.4.0"
+  }
+}

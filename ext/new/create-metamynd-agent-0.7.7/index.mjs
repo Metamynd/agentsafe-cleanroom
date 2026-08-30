@@ -1,0 +1,2004 @@
+#!/usr/bin/env node
+// create-metamynd-agent — scaffold a MetaMynd/AgentSafe-governed agent in one command.
+//
+// Logs a KYB-verified owner in, provisions the agent in ONE call
+// (POST /onboarding/agent → identity + mandate + starter SOP + enforced Standards),
+// writes the portable `agent.metamynd.json` and a runnable agent example, PLUS (by default)
+// a separate `gateway/` process — a second, independent guard that re-verifies every request
+// and holds the real tool, so the agent's own guardTool() call is a convenience, not the
+// enforcement boundary. `--no-gateway` skips it (see README#separate-tool-gateway-default).
+//
+// ZERO dependencies: Node ≥ 18 built-ins only (fetch, readline).
+//
+//   npm create metamynd-agent@latest
+//   npx create-metamynd-agent
+//   npx create-metamynd-agent --api http://localhost:9926/api/v1 --email you@x.com \
+//       --name "Support Bot" --scope flight-purchase --per-txn-max 500 --out ./support-bot --yes
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import readline from 'node:readline';
+import crypto from 'node:crypto';
+
+const GUARD_PKG = '@metamynd/agentsafe-guard';
+// Must track the guard's MINOR line, not just its major. On a 0.x package `^0.4.0` means
+// >=0.4.0 <0.5.0, so leaving this at ^0.4.0 would scaffold an agent whose `npm test` runs
+// `agentsafe-guard verify` against a guard that has no such command.
+// 0.6.0 adds the amount-unknown atom (deny-by-default when a value-moving action's amount
+// can't be determined) — this was already missed once (this constant sat at ^0.5.0 through the
+// whole 0.6.0 release), silently scaffolding every new project without that protection.
+const GUARD_VERSION = '^0.6.0';
+// The default hosted scaffold's SECOND process — the tool gateway (see scaffoldProject).
+const MCP_GUARD_PKG = '@metamynd/agentsafe-mcp-guard';
+// 0.2.0 adds requireAuthorization (closes replay + cumulative spend) — this scaffold sets that
+// option, so a range that could resolve below 0.2.0 would silently scaffold a no-op.
+// 0.3.0 adds the same amount-unknown atom as the guard, above — same reasoning, same miss.
+const MCP_GUARD_VERSION = '^0.3.0';
+const GATEWAY_PKG = '@metamynd/agentsafe-http-gateway';
+// 0.2.0 fixes a confused-deputy gap (payload not bound to the signed request) — the CLI must
+// never scaffold a range that could resolve below it.
+// 0.3.0 was a first, INCOMPLETE attempt at the follow-on gap (checked only "did the body offer
+// NONE of the three fields" — a correct decoy in one field let the other hide anywhere). 0.4.0
+// is the actual fix: requires amount/merchant specifically, whenever the signature names a real
+// value for them. Re-tested live and closed same day; ^0.3.0 here would still resolve to the
+// broken version.
+const GATEWAY_VERSION = '^0.4.0';
+const DEFAULT_API = 'https://metamynd.ai/api/v1';
+const DEFAULT_GATEWAY_PORT = 4401; // distinct from --harness's dashboard (4400)
+
+// ---------- tiny ANSI ----------
+const c = {
+  b: (s) => `\x1b[1m${s}\x1b[0m`,
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+  green: (s) => `\x1b[32m${s}\x1b[0m`,
+  red: (s) => `\x1b[31m${s}\x1b[0m`,
+  yellow: (s) => `\x1b[33m${s}\x1b[0m`,
+  cyan: (s) => `\x1b[36m${s}\x1b[0m`,
+};
+
+// ---------- args ----------
+function parseArgs(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-h' || a === '--help') { out.help = true; continue; }
+    if (a === '-v' || a === '--version') { out.version = true; continue; }
+    if (a === '-y' || a === '--yes' || a === '--non-interactive') { out.yes = true; continue; }
+    // Explicit, so `--force ./dir` cannot swallow the path as this flag's value.
+    if (a === '-f' || a === '--force') { out.force = true; continue; }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      if (eq !== -1) { out[a.slice(2, eq)] = a.slice(eq + 1); continue; }
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) { out[key] = true; }
+      else { out[key] = next; i++; }
+    } else { out._.push(a); }
+  }
+  return out;
+}
+
+const HELP = `${c.b('create-metamynd-agent')} — scaffold a governed AI agent
+
+${c.b('Usage')}
+  npm create metamynd-agent@latest
+  npx create-metamynd-agent [options]
+
+${c.b('Options')}
+  --harness            No login, no KYB, no network at all: a free local governance harness —
+                       your own rules, your own identity, decided entirely on this machine. See
+                       README#harness. Not for enterprise use (no anchored identity/evidence,
+                       no cross-party trust) — that is what the hosted platform adds.
+  --sandbox            No login, no KYB: scaffold against the shared sandbox agent (fastest start)
+  --config <file>      A JSON policy file (name/scope/limits + simple "rules") — see README#config-file.
+                       Flags below still override individual fields from the file. Works with
+                       --harness too (its rules become the harness's starter rules file).
+  --request            Delegated: request an agent for an owner's org (--owner <email>, +--byok)
+  --claim [--watch]    Delegated: claim the config once the owner approves (reads metamynd-request.json)
+  --owner <email>      Target owner's email (with --request)
+  --force, -f          Scaffold into a non-empty directory, overwriting existing files
+  --api <url>          API base (default ${DEFAULT_API})
+  --email <email>      Owner login email
+  --password <pw>      Owner password (prefer the interactive prompt or METAMYND_PASSWORD)
+  --name <name>        Agent name (e.g. "Support Bot")
+  --scope <scope>      Mandate action scope (e.g. flight-purchase)
+  --per-txn-max <n>    Per-transaction cap (default 500)
+  --max-amount <n>     Total mandate budget (default 10000)
+  --currency <cur>     Currency (default USD)
+  --merchants <a,b>    Allowed merchants, comma-separated (optional)
+  --byok               Bring-your-own-key: generate the keypair locally, provision + prove control
+                       (MetaMynd never sees the private key). Overridden by --public-key.
+  --public-key <hex>   BYOK with a key you already hold (SPKI/raw hex); you prove control yourself
+  --out <dir>          Output project directory (default ./<agent-slug>)
+  --no-gateway         Hosted flow only: skip the separate tool-gateway process (see
+                       README#separate-tool-gateway-default) and scaffold the old
+                       single-process example instead. Not a separate enforcement boundary.
+  --gateway-port <n>   Hosted flow only: the gateway process's port (default 4401)
+  --port <n>           --harness only: the local dashboard's port (default 4400)
+  --yes, -y            Non-interactive: use flags/env/defaults, never prompt
+  -h, --help           Show this help
+  -v, --version        Show version
+
+${c.b('Environment')}
+  METAMYND_API, METAMYND_EMAIL, METAMYND_PASSWORD  — fallbacks for the flags above
+
+${c.b('What it does')}
+  1. Logs in as a KYB-verified owner       → owner access token
+  2. POST /onboarding/agent (one call)      → identity + mandate + SOP + Standards
+  3. Writes agent.metamynd.json + index.mjs, PLUS (by default) a separate gateway/ process —
+     the real enforcement boundary, not index.mjs's own guard.guardTool() call. --no-gateway
+     skips it.
+`;
+
+// ---------- prompts ----------
+function makeRl() {
+  return readline.createInterface({ input: process.stdin, output: process.stdout });
+}
+function ask(rl, query, def) {
+  const suffix = def !== undefined && def !== '' ? c.dim(` (${def})`) : '';
+  return new Promise((res) => rl.question(`${query}${suffix}: `, (a) => res(a.trim() || (def ?? ''))));
+}
+// Hidden input (password) — raw mode, masks with '*', handles backspace/paste/Ctrl-C.
+function askHidden(query) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    process.stdout.write(`${query}: `);
+    const wasRaw = stdin.isRaw;
+    if (stdin.setRawMode) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    let input = '';
+    const done = () => {
+      if (stdin.setRawMode) stdin.setRawMode(Boolean(wasRaw));
+      stdin.pause();
+      stdin.removeListener('data', onData);
+      process.stdout.write('\n');
+      resolve(input);
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        const code = ch.charCodeAt(0);
+        if (code === 13 || code === 10 || code === 4) { done(); return; } // Enter / Ctrl-D
+        if (code === 3) { process.stdout.write('\n'); process.exit(130); } // Ctrl-C
+        if (code === 127 || code === 8) { if (input.length) { input = input.slice(0, -1); process.stdout.write('\b \b'); } continue; } // backspace
+        if (code < 32) continue; // ignore other control chars
+        input += ch;
+        process.stdout.write('*');
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+function fail(msg) {
+  console.error(`\n${c.red('✖')} ${msg}\n`);
+  process.exit(1);
+}
+
+// ---------- policy config file (--config) ----------
+// The API/SOP/molecule authoring surface is real, but it is not where a developer wants to
+// START — round-five feedback named this precisely: "developers need a simpler policy file
+// first." Everything a simple file needs already exists server-side (ProvisionSchema already
+// takes mandate limits + an optional sop.documentJson.molecules array in one flat JSON body),
+// so this is a thin, ZERO-DEPENDENCY translator — plain JSON, not YAML, so the CLI keeps the
+// "no dependencies at all" property the guard itself is built on — not a new policy engine.
+//
+// Shape:
+//   {
+//     "name": "Procurement Agent", "scope": "purchase-order", "currency": "USD",
+//     "maxAmount": 20000, "perTxnMax": 2000, "merchants": ["acme-supplies"],
+//     "rules": [
+//       { "when": { "predicate": "amount-over", "config": { "limit": 2000 } }, "then": "escalate" }
+//     ]
+//   }
+// `rules` is sugar for the common one-atom-one-decision case, compiled to a `molecules` array
+// below. A caller who needs a real combinator/multi-atom molecule can supply `molecules`
+// directly instead — `rules` is ignored when `molecules` is present.
+function loadConfigFile(path) {
+  let raw;
+  try { raw = readFileSync(resolve(path), 'utf8'); }
+  catch (e) { fail(`Could not read config file ${path} (${e.message})`); }
+  let json;
+  try { json = JSON.parse(raw); }
+  catch (e) { fail(`${path} is not valid JSON (${e.message})`); }
+  if (json === null || typeof json !== 'object' || Array.isArray(json)) {
+    fail(`${path} must be a JSON object.`);
+  }
+  return json;
+}
+
+// A rule needs `when.predicate` (the atom) and `then` (the decision the gate should return
+// when it fires) — everything else is optional sugar. See backend's atom-catalog.ts for the
+// full predicate list (amount-over, risk-at-or-above, jurisdiction-not-allowed, ...).
+function ruleToMolecule(rule, i) {
+  const when = rule?.when;
+  if (!when || typeof when.predicate !== 'string') {
+    fail(`rules[${i}] needs a "when.predicate" — see the config file docs for the atom list.`);
+  }
+  if (typeof rule.then !== 'string') {
+    fail(`rules[${i}] needs a "then" decision (e.g. "block", "escalate").`);
+  }
+  return {
+    id: `r${i + 1}`,
+    name: rule.name,
+    combinator: 'all',
+    atoms: [{ id: 'a1', predicate: when.predicate, config: when.config ?? {} }],
+    decision: rule.then,
+    reasonCode: rule.reasonCode ?? `${when.predicate.toUpperCase().replace(/-/g, '_')}_${String(rule.then).toUpperCase()}`,
+  };
+}
+
+/** Builds the `sop`/`rulePack` fields to merge into the provisioning body, or {} if the config file specifies neither. */
+function configFileSopFields(config) {
+  if (!config) return {};
+  if (Array.isArray(config.molecules)) return { sop: { documentJson: { molecules: config.molecules } } };
+  if (Array.isArray(config.rules) && config.rules.length) {
+    return { sop: { documentJson: { molecules: config.rules.map(ruleToMolecule) } } };
+  }
+  if (typeof config.rulePack === 'string') return { rulePack: config.rulePack };
+  return {};
+}
+
+function slugify(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'metamynd-agent';
+}
+
+// ---------- BYOK (bring-your-own-key) ----------
+// Generate an Ed25519 keypair CLIENT-SIDE — the private key never leaves this machine, so MetaMynd
+// never sees it. The public key is sent as SPKI DER hex (algorithm-tagged Ed25519, unambiguous to
+// the Hedera SDK); the private key is PKCS8 DER hex, the exact format the guard's createGuard loads.
+function generateAgentKeypair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  return {
+    publicKeyHex: publicKey.export({ format: 'der', type: 'spki' }).toString('hex'),
+    privateKeyHex: privateKey.export({ format: 'der', type: 'pkcs8' }).toString('hex'),
+  };
+}
+
+// Sign a BYOK challenge exactly as the gate verifies it: Ed25519 over the UTF-8 bytes of the raw
+// challenge nonce, hex-encoded. Mirrors agentsafe-guard's sign().
+function signChallengeHex(privateKeyHex, challenge) {
+  const key = crypto.createPrivateKey({ key: Buffer.from(privateKeyHex, 'hex'), format: 'der', type: 'pkcs8' });
+  return crypto.sign(null, Buffer.from(challenge, 'utf8'), key).toString('hex');
+}
+
+// ---------- API ----------
+async function apiPost(base, path, body, token) {
+  let res;
+  try {
+    res = await fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    fail(`Cannot reach ${base}${path} — is the API up? (${e.message})`);
+  }
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
+  if (!res.ok) {
+    const detail = json?.message ? (typeof json.message === 'string' ? json.message : JSON.stringify(json.message)) : text.slice(0, 300);
+    fail(`${path} → HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+  }
+  return json;
+}
+
+// ---------- scaffolding ----------
+/**
+ * The --no-gateway / --sandbox variant: the tool is a local function in the SAME process as
+ * guard.guardTool(). Fine for a demo with nothing real behind it (--sandbox always uses this —
+ * it's a shared identity, never meant to hold real credentials). For anything that touches a
+ * real credential, guard.guardTool() alone is a client-side convenience, not a boundary: it
+ * still calls this handler in-process regardless of where the decision came from, so an agent
+ * that skips it and calls bookFlight() directly gets the same result the gate would have given
+ * it — the same shape of gap --harness's README documents. See exampleIndex() below, which is
+ * what the real (non-sandbox) flow scaffolds by default instead.
+ */
+function exampleIndexNoGateway(scope, perTxnMax) {
+  const under = Math.max(1, Math.round(perTxnMax * 0.5));
+  const over = Math.round(perTxnMax + 100);
+  return `// index.mjs — your agent, governed by MetaMynd/AgentSafe.
+// Every governed tool call is checked (allow / block / escalate) before it runs.
+import { createGuardFromConfig } from '${GUARD_PKG}';
+
+// Loads agent.metamynd.json: the agent's DID, its signing key, and the gate to call.
+const guard = await createGuardFromConfig('./agent.metamynd.json'); // no env vars
+
+// --- Your real tool. Replace the body with your actual implementation. ---
+// --- If that implementation touches a real credential, this in-process call is NOT an
+// --- enforcement boundary: guard.guardTool() below still calls this function directly in
+// --- THIS process regardless of the decision's source, so anything that can call it directly
+// --- gets the same result the gate would have given it. A real (non --sandbox) scaffold
+// --- without --no-gateway moves this behind a separate process instead. See README.
+async function bookFlight(args) {
+  return { pnr: 'PNR-DEMO', ...args };
+}
+
+// --- The GATED version. Register THIS with your agent instead of the raw handler. ---
+const gatedBookFlight = guard.guardTool(
+  '${scope}',                                   // = your mandate scope
+  bookFlight,
+  (a) => ({                                     // map tool args → gate inputs
+    amount: a.amount,
+    currency: 'USD',
+    merchant: a.merchant,
+    context: { tool: 'book-flight', riskLevel: a.riskLevel ?? 'low' },
+  }),
+);
+
+// --- A tool the agent was NEVER granted. Wrapping it is the demonstration: there is no
+// --- rule anywhere forbidding this. The mandate simply never mentioned the action.
+async function raiseOwnLimit(args) {
+  return { updated: true, ...args };          // never runs, and that is the point
+}
+
+const gatedRaiseOwnLimit = guard.guardTool(
+  'permissions.update',                       // an action NOT in the mandate
+  raiseOwnLimit,
+  (a) => ({
+    amount: a.amount,
+    currency: 'USD',
+    merchant: a.merchant,
+    context: { tool: 'permissions-update' },
+  }),
+);
+
+const dim = (t) => '\\x1b[2m' + t + '\\x1b[0m';
+const bold = (t) => '\\x1b[1m' + t + '\\x1b[0m';
+const rule = (n) => '  ' + '-'.repeat(n);
+
+// Plain-English meaning for the reason codes this demo can produce.
+const WHY = {
+  AUTHORIZED: 'inside the mandate and under the SOP spend cap',
+  SOP_SPEND_CAP: 'your SOP caps a single transaction at $${perTxnMax}',
+  RISK_REVIEW: 'your SOP sends high-risk actions to a human first',
+  MERCHANT_NOT_ALLOWED: 'the mandate lists which merchants this agent may pay',
+  // Both say the same thing from where you are standing: the mandate does not cover that
+  // action. Which one you see depends on whether the verdict was reached here or at the
+  // gate, and neither of them depends on the amount.
+  NO_PERMISSION_FOR_ACTION: 'the mandate never granted this action - at any amount',
+  NO_MANDATE: 'there is no mandate for this action at all',
+};
+
+// ---------------------------------------------------------------- 1. CONTEXT
+console.log('');
+console.log(bold('  What this simulation shows'));
+console.log('');
+console.log('  An agent should not be the thing that decides what it is allowed to do.');
+console.log('  This run makes that concrete. Three attempts take the SAME code path and');
+console.log('  produce three different outcomes. The fourth asks for something the agent');
+console.log('  was never granted at all - and that is the one a prompt could not have');
+console.log('  stopped, because the decision is not made inside your program.');
+
+// ---------------------------------------------------------------- 2. MECHANISM
+console.log('');
+console.log(bold('  How it does that'));
+console.log('');
+console.log(dim('   1. this project holds an agent identity (a DID) and its signing key'));
+console.log(dim('   2. that agent has a mandate - a scope it may act in, and a spend cap'));
+console.log(dim('   3. guardTool() wraps your tool, so nothing calls the raw handler'));
+console.log(dim('   4. each attempt is signed here, then decided by MetaMynd remotely'));
+console.log(dim('   5. your tool runs ONLY if that decision is ALLOW'));
+console.log('');
+console.log(dim('  scope  ${scope}'));
+console.log(dim('  cap    $${perTxnMax} per transaction, set by your SOP'));
+
+// ---------------------------------------------------------------- 3. THE STEPS
+async function attempt(n, intent, args, tool = gatedBookFlight) {
+  console.log('');
+  console.log(bold('  Step ' + n + ' of 4') + ' - ' + intent);
+  console.log(dim('     signing the request locally, then asking the gate to decide...'));
+  try {
+    const r = await tool(args);
+    console.log('\\x1b[32m     ALLOWED\\x1b[0m  your tool ran and returned ' + (r.pnr ?? 'ok'));
+    console.log(dim('     ' + WHY.AUTHORIZED));
+  } catch (e) {
+    const g = e.governance ?? {};
+    const why = WHY[g.reasonCode] ?? e.message;
+    if (g.decision === 'escalate') {
+      console.log('\\x1b[33m     ESCALATED\\x1b[0m  held for a human - ' + g.reasonCode);
+      console.log(dim('     ' + why));
+      console.log(dim('     not a failure: approve it in the dashboard and the action resumes.'));
+    } else {
+      console.log('\\x1b[31m     BLOCKED\\x1b[0m  ' + (g.reasonCode ?? 'refused'));
+      console.log(dim('     ' + why));
+      console.log(dim('     your tool never ran - the gate refused before execution.'));
+    }
+  }
+}
+
+console.log('');
+console.log(rule(66));
+await attempt(1, 'a $${under} booking, low risk. Expected to pass.', { amount: ${under}, merchant: 'skyward-air', riskLevel: 'low' });
+await attempt(2, 'a $${over} booking, deliberately over the cap.', { amount: ${over}, merchant: 'skyward-air', riskLevel: 'low' });
+await attempt(3, 'a $${under} booking, but flagged high risk.', { amount: ${under}, merchant: 'skyward-air', riskLevel: 'high' });
+await attempt(
+  4,
+  'the agent stops booking flights and asks to raise its OWN limit.',
+  { amount: 100000, merchant: 'skyward-air' },
+  gatedRaiseOwnLimit,
+);
+console.log('');
+console.log(rule(66));
+
+// ---------------------------------------------------------------- 4. RESULT
+console.log('');
+console.log(bold('  What this proved'));
+console.log('');
+console.log(dim('   - one code path, three outcomes. The rules decided, not this file'));
+console.log(dim('     and not the model driving it.'));
+console.log(dim('   - step 4 needed no rule to stop it. The agent could not widen its own'));
+console.log(dim('     authority, because it cannot name an action nobody delegated to it.'));
+console.log(dim('   - the blocked call never reached your tool at all.'));
+console.log(dim('   - every decision was recorded as tamper-evident evidence.'));
+console.log(dim('   - if the gate were unreachable the guard fails CLOSED: it blocks.'));
+console.log('');
+console.log(bold('  Without MetaMynd, you can be bypassed.') + ' bookFlight() runs in THIS process -');
+console.log(dim('  call it directly instead of gatedBookFlight and nothing above stops you.'));
+console.log(dim('  Re-scaffold without --sandbox/--no-gateway for the default shape, which does.'));
+console.log('');
+console.log('  Change the cap in the dashboard (Legal Entity -> SOPs) and run again.');
+console.log(dim('  The outcome changes. This file does not. That is the point.'));
+console.log('');
+`;
+}
+
+/**
+ * The DEFAULT hosted scaffold: the tool lives in a separate process (./gateway), not here.
+ * guard.guardTool() below is still called — it is a fast, local, client-side pre-check that
+ * gives good UX (fail fast, no round trip for an obviously-blocked call) — but it is not what
+ * stops a bypass. What stops a bypass is that there is no bookFlight() in THIS process to call
+ * directly: it only exists in ./gateway, which independently re-verifies every request against
+ * this agent's own policy bundle before it runs, and holds any real credentials the tool needs.
+ */
+function exampleIndex(scope, perTxnMax, gatewayPort) {
+  const under = Math.max(1, Math.round(perTxnMax * 0.5));
+  const over = Math.round(perTxnMax + 100);
+  return `// index.mjs — your agent, governed by MetaMynd/AgentSafe.
+// Every governed tool call is checked TWICE before it runs: once here (fast, local, client-side),
+// and independently again by ./gateway — a SEPARATE process that holds the real tool and its
+// credentials. That second check is the actual enforcement boundary; see ./gateway/README.md.
+import { createGuardFromConfig } from '${GUARD_PKG}';
+
+// Loads agent.metamynd.json: the agent's DID, its signing key, and the gate to call.
+const guard = await createGuardFromConfig('./agent.metamynd.json'); // no env vars
+
+const GATEWAY = process.env.GATEWAY_URL || 'http://localhost:${gatewayPort}';
+
+// --- Calls the gateway process instead of a local function. There is no raw bookFlight() in
+// --- this file to call directly — the tool, and any real credentials it needs, live only in
+// --- ./gateway, which independently re-verifies this signed request itself.
+// --- \`decision\` is guardTool()'s own verdict, already produced by the REAL remote gate for any
+// --- value-bearing action (sealValueActions, on by default) — its authorizationId is what lets
+// --- the gateway atomically claim single-use execution, closing replay + cumulative spend, not
+// --- just re-checking policy. See ./gateway/README.md.
+async function bookFlightViaGateway(args, decision) {
+  const signed = guard.buildSignedRequest({
+    action: '${scope}',
+    amount: args.amount,
+    currency: 'USD',
+    merchant: args.merchant,
+    context: { tool: 'book-flight', riskLevel: args.riskLevel ?? 'low' },
+  });
+  signed.authorizationId = decision?.authorizationId;
+  const res = await fetch(GATEWAY + '/book-flight', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-magp-request': JSON.stringify(signed) },
+    body: JSON.stringify(args),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const err = new Error('gateway ' + res.status + ': ' + (body?.reasonCode ?? 'refused'));
+    err.name = 'GovernanceBlocked';
+    err.governance = { decision: body?.decision ?? 'block', reasonCode: body?.reasonCode ?? 'GATEWAY_ERROR' };
+    throw err;
+  }
+  return body;
+}
+
+// --- The GATED version. Register THIS with your agent instead of calling the gateway directly.
+// --- This local check and the gateway's own re-check are independent; neither trusts the other.
+const gatedBookFlight = guard.guardTool(
+  '${scope}',                                   // = your mandate scope
+  bookFlightViaGateway,
+  (a) => ({                                     // map tool args → gate inputs
+    amount: a.amount,
+    currency: 'USD',
+    merchant: a.merchant,
+    context: { tool: 'book-flight', riskLevel: a.riskLevel ?? 'low' },
+  }),
+);
+
+// --- A tool the agent was NEVER granted. Wrapping it is the demonstration: there is no
+// --- rule anywhere forbidding this. The mandate simply never mentioned the action.
+async function raiseOwnLimit(args) {
+  return { updated: true, ...args };          // never runs, and that is the point
+}
+
+const gatedRaiseOwnLimit = guard.guardTool(
+  'permissions.update',                       // an action NOT in the mandate
+  raiseOwnLimit,
+  (a) => ({
+    amount: a.amount,
+    currency: 'USD',
+    merchant: a.merchant,
+    context: { tool: 'permissions-update' },
+  }),
+);
+
+const dim = (t) => '\\x1b[2m' + t + '\\x1b[0m';
+const bold = (t) => '\\x1b[1m' + t + '\\x1b[0m';
+const rule = (n) => '  ' + '-'.repeat(n);
+
+// Plain-English meaning for the reason codes this demo can produce. The gateway re-evaluates
+// the SAME policy bundle with the SAME evaluator the gate uses, so it produces these same codes.
+const WHY = {
+  AUTHORIZED: 'inside the mandate and under the SOP spend cap',
+  SOP_SPEND_CAP: 'your SOP caps a single transaction at $${perTxnMax}',
+  RISK_REVIEW: 'your SOP sends high-risk actions to a human first',
+  MERCHANT_NOT_ALLOWED: 'the mandate lists which merchants this agent may pay',
+  // Both say the same thing from where you are standing: the mandate does not cover that
+  // action. Which one you see depends on whether the verdict was reached here or at the
+  // gate, and neither of them depends on the amount.
+  NO_PERMISSION_FOR_ACTION: 'the mandate never granted this action - at any amount',
+  NO_MANDATE: 'there is no mandate for this action at all',
+};
+
+// ---------------------------------------------------------------- 1. CONTEXT
+console.log('');
+console.log(bold('  What this simulation shows'));
+console.log('');
+console.log('  An agent should not be the thing that decides what it is allowed to do — and');
+console.log('  it should not be the thing that RUNS what it decided, either. This run makes');
+console.log('  both concrete. Three attempts take the SAME code path and produce three');
+console.log('  different outcomes. The fourth asks for something the agent was never granted');
+console.log('  at all - and that is the one a prompt could not have stopped, because the');
+console.log('  decision is not made inside your program, and the tool is not either.');
+
+// ---------------------------------------------------------------- 2. MECHANISM
+console.log('');
+console.log(bold('  How it does that'));
+console.log('');
+console.log(dim('   1. this project holds an agent identity (a DID) and its signing key'));
+console.log(dim('   2. that agent has a mandate - a scope it may act in, and a spend cap'));
+console.log(dim('   3. guardTool() wraps your tool call, giving a fast local pre-check'));
+console.log(dim('   4. each attempt is ALSO signed and sent to ./gateway - a separate process'));
+console.log(dim('   5. the gateway independently re-verifies before your tool runs there'));
+console.log(dim('   6. there is no local bookFlight() to call directly - only the gateway has it'));
+console.log('');
+console.log(dim('  scope    ${scope}'));
+console.log(dim('  cap      $${perTxnMax} per transaction, set by your SOP'));
+console.log(dim('  gateway  ' + GATEWAY + '  (run it in a separate terminal - see ./gateway)'));
+
+// ---------------------------------------------------------------- 3. THE STEPS
+async function attempt(n, intent, args, tool = gatedBookFlight) {
+  console.log('');
+  console.log(bold('  Step ' + n + ' of 4') + ' - ' + intent);
+  console.log(dim('     signing the request locally, then asking the gate to decide...'));
+  try {
+    const r = await tool(args);
+    console.log('\\x1b[32m     ALLOWED\\x1b[0m  your tool ran (in ./gateway) and returned ' + (r.pnr ?? 'ok'));
+    console.log(dim('     ' + WHY.AUTHORIZED));
+  } catch (e) {
+    const g = e.governance ?? {};
+    const why = WHY[g.reasonCode] ?? e.message;
+    if (g.decision === 'escalate') {
+      console.log('\\x1b[33m     ESCALATED\\x1b[0m  held for a human - ' + g.reasonCode);
+      console.log(dim('     ' + why));
+      console.log(dim('     not a failure: approve it in the dashboard and the action resumes.'));
+    } else {
+      console.log('\\x1b[31m     BLOCKED\\x1b[0m  ' + (g.reasonCode ?? 'refused'));
+      console.log(dim('     ' + why));
+      console.log(dim('     your tool never ran - refused before execution.'));
+    }
+  }
+}
+
+console.log('');
+console.log(rule(66));
+await attempt(1, 'a $${under} booking, low risk. Expected to pass.', { amount: ${under}, merchant: 'skyward-air', riskLevel: 'low' });
+await attempt(2, 'a $${over} booking, deliberately over the cap.', { amount: ${over}, merchant: 'skyward-air', riskLevel: 'low' });
+await attempt(3, 'a $${under} booking, but flagged high risk.', { amount: ${under}, merchant: 'skyward-air', riskLevel: 'high' });
+await attempt(
+  4,
+  'the agent stops booking flights and asks to raise its OWN limit.',
+  { amount: 100000, merchant: 'skyward-air' },
+  gatedRaiseOwnLimit,
+);
+console.log('');
+console.log(rule(66));
+
+// ---------------------------------------------------------------- 4. RESULT
+console.log('');
+console.log(bold('  What this proved'));
+console.log('');
+console.log(dim('   - one code path, three outcomes. The rules decided, not this file'));
+console.log(dim('     and not the model driving it.'));
+console.log(dim('   - step 1 ran in ./gateway, a process this file cannot reach into. There'));
+console.log(dim('     is no rawBookFlight() here to call instead - that is what actually'));
+console.log(dim('     stops a bypass, not the guardTool() call above it.'));
+console.log(dim('   - step 4 needed no rule to stop it. The agent could not widen its own'));
+console.log(dim('     authority, because it cannot name an action nobody delegated to it.'));
+console.log(dim('   - every blocked/escalated call never reached a real tool at all.'));
+console.log(dim('   - if the gate were unreachable the guard fails CLOSED: it blocks.'));
+console.log('');
+console.log(bold('  With MetaMynd, you can\\'t be bypassed.') + ' ./gateway is why - it independently');
+console.log(dim('  re-verified step 1 before running it, and holds the tool this file never can.'));
+console.log('');
+console.log('  Change the cap in the dashboard (Legal Entity -> SOPs) and run again.');
+console.log(dim('  The outcome changes. This file does not. That is the point.'));
+console.log('');
+`;
+}
+
+function examplePackageJson(slug) {
+  return JSON.stringify(
+    {
+      name: slug,
+      version: '0.1.0',
+      private: true,
+      type: 'module',
+      // `verify` is scaffolded in because governance that lives only in a dashboard is a
+      // thing someone has to remember to look at. As a build step it is a control: a change
+      // that widens this agent's authority fails `npm test`.
+      scripts: { start: 'node index.mjs', test: 'agentsafe-guard verify' },
+      dependencies: { [GUARD_PKG]: GUARD_VERSION },
+    },
+    null,
+    2,
+  ) + '\n';
+}
+
+function exampleReadme(slug, scope, withGateway, gatewayPort) {
+  const gatewaySection = withGateway
+    ? `## Run
+
+Two processes — start the gateway first, in its own terminal:
+
+\`\`\`bash
+cd gateway && npm install && npm start   # the REAL enforcement boundary — see gateway/README.md
+\`\`\`
+
+Then, in this directory:
+
+\`\`\`bash
+npm install
+npm start
+\`\`\`
+
+You should see an ALLOW (fulfilled by \`./gateway\`), a BLOCK (over the per-transaction cap), and
+an ESCALATE (high risk). The BLOCK and ESCALATE never reach the gateway at all — this file's own
+\`guard.guardTool()\` refuses them first. Only the ALLOW crosses into the other process.
+
+## Files
+
+- \`agent.metamynd.json\` — your portable guard config (identity, mandate scope \`${scope}\`, issuer keys).
+  **Contains the agent's secret key — never commit it.** It is already in \`.gitignore\`.
+- \`index.mjs\` — signs each request and calls \`./gateway\` for it; \`guard.guardTool()\` here is a
+  fast local pre-check, not the enforcement boundary.
+- \`gateway/\` — a **separate process**. It holds the real tool and independently re-verifies every
+  request against this agent's own policy before running it. See \`gateway/README.md\` — read that
+  one first if you're only going to read one.
+
+## What this is not
+
+`
+    : `## Run
+
+\`\`\`bash
+npm install
+npm start
+\`\`\`
+
+You should see an ALLOW, a BLOCK (over the per-transaction cap), and an ESCALATE (high risk).
+
+## Files
+
+- \`agent.metamynd.json\` — your portable guard config (identity, mandate scope \`${scope}\`, issuer keys).
+  **Contains the agent's secret key — never commit it.** It is already in \`.gitignore\`.
+- \`index.mjs\` — wraps a tool with \`guard.guardTool(...)\`; the tool only runs when the gate allows.
+
+## What this is not
+
+`;
+  return `# ${slug}
+
+A MetaMynd/AgentSafe-governed agent, scaffolded with \`create-metamynd-agent\`.
+
+${gatewaySection}${
+    withGateway
+      ? `**With MetaMynd's gateway, you can't be bypassed** — that's what this section is about.
+This scaffold's default shape (agent + separate gateway process, port ${gatewayPort} by default)
+is the actual enforcement boundary: \`guard.guardTool()\` in \`index.mjs\` is a client-side
+convenience, not a boundary — it still runs its handler in-process regardless of where the
+decision came from. What actually stops direct-call and confused-deputy bypasses is that
+\`bookFlight()\` itself only exists in \`./gateway\`, a process this one cannot reach into, which
+independently re-verifies every request against this agent's own policy bundle AND binds it to
+the actual body being executed. Replay and cumulative spend are closed too, via
+\`requireAuthorization\` — see \`./gateway/README.md\`'s "What this closes, precisely" section for
+exactly what that covers, including the one narrower gap disclosed there. Re-scaffold with
+\`--no-gateway\` for the old single-process shape — it is NOT a separate enforcement boundary at
+all; see its own generated README for why.`
+      : `**Without MetaMynd, you can be bypassed** — this is that case. This scaffold has no
+separate gateway process (either \`--sandbox\`, which never provisions real credentials, or
+\`--no-gateway\` was passed): \`guard.guardTool()\` wraps a tool in the SAME process as the check
+itself. That is a client-side convenience, not a boundary — it still runs your tool's handler
+in-process regardless of where the decision came from, so anything able to call \`bookFlight()\`
+directly gets the same result the gate would have given it. If this tool ever holds a real
+credential, provision for real (drop \`--sandbox\`) without \`--no-gateway\` for the default
+shape, which puts the tool behind a separate process instead. This is the same structural gap
+\`--harness\`'s README documents, for the same reason: a cooperative in-process check has no
+counterparty to disagree with a caller that skips it.`
+  }
+
+## Change the rules
+
+Edit the agent's SOPs in the dashboard (Legal Entity → SOPs). The agent's behaviour changes live —
+no redeploy. An \`escalate\` verdict is held for an owner to approve; poll \`guard.escalationStatus(id)\`.
+
+Full integration guide: \`docs/integration/INTEGRATE-WITH-METAMYND.md\`.
+`;
+}
+
+function gitignore() {
+  return `node_modules/\nagent.metamynd.json\n.env\n`;
+}
+
+// ---------- the default hosted scaffold's second process: a separate tool gateway ----------
+//
+// Not a new protocol — @metamynd/agentsafe-mcp-guard (trustless verifyRequest, already public)
+// and @metamynd/agentsafe-http-gateway (the generic reverse-proxy built on it, already public)
+// do the real work. This just wires up the smallest useful shape: one protected route, one
+// tool, re-verified independently of the agent that's calling it. See demo/duffel-mcp-gateway
+// in the AgentSafe repo for the full pattern (mutual handshake, x402 payment, capability
+// binding) this is a minimal slice of.
+
+function gatewayServerFile(scope, port, apiBase) {
+  return `#!/usr/bin/env node
+// gateway/server.mjs — the REAL enforcement boundary for this agent's tool(s).
+//
+// This is a SEPARATE process from the agent. It holds the tool's real credentials (the agent
+// process never does), and it independently re-verifies every request against this agent's OWN
+// published policy bundle — it does not trust the agent's own guard.guardTool() check. A
+// compromised or dishonest agent calling its own local function gets nothing here, because
+// there is no local function: the tool only runs in this process.
+import http from 'node:http';
+import { createMcpGuard } from '${MCP_GUARD_PKG}';
+import { createHttpGateway } from '${GATEWAY_PKG}';
+
+const PORT = Number(process.env.PORT || ${port});
+const MAGP_API = process.env.MAGP_API || '${apiBase}';
+
+// --- Your real tool. Real credentials (an airline API key, a payment key, ...) belong ONLY
+// --- here, read from process.env (see .env.example) — never in the agent process.
+async function bookFlight(args) {
+  return { pnr: 'PNR-DEMO', ...args };
+}
+
+// One protected route: only a request signed by this agent, for exactly this action, and
+// re-verified against this agent's own mandate/SOP, reaches bookFlight() below.
+const routes = [{ method: 'POST', path: '/book-flight', action: '${scope}' }];
+
+// No serviceKey: this minimal gateway only calls verifyRequest() (re-check a signed request),
+// not the mutual-handshake methods, which are the only thing that needs it.
+//
+// requireAuthorization: true is what closes replay and cumulative spend, not just per-request
+// policy — it requires the agent's authorizationId (from a REAL guard.authorize() call) to
+// atomically claim single-use execution against the issuer before this gateway runs the tool.
+const guard = createMcpGuard({ serviceDid: 'did:local:${scope}-gateway', issuerApi: MAGP_API, requireAuthorization: true });
+
+const gateway = createHttpGateway({
+  guard,
+  routes,
+  forward: async (req) => {
+    let args = {};
+    try { args = JSON.parse(req.rawBody?.toString('utf8') || '{}'); } catch { /* empty body */ }
+    const result = await bookFlight(args);
+    return { status: 200, body: result };
+  },
+  // This gateway IS the tool, not a proxy in front of one — an unmatched path has nothing to
+  // pass through TO. Without this, any path a route doesn't match falls through ungoverned
+  // straight to forward() above, which would run bookFlight() with no check at all.
+  denyByDefault: true,
+});
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const rawBody = await readBody(req);
+    const result = await gateway({ method: req.method, path: req.url, headers: req.headers, rawBody });
+    const headers = { 'content-type': 'application/json' };
+    if (result.governance) headers['x-agentsafe-decision'] = result.governance.decision;
+    res.writeHead(result.status, headers);
+    res.end(JSON.stringify(result.body ?? {}));
+  } catch (err) {
+    // Fail CLOSED on any gateway error.
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ decision: 'block', reasonCode: 'GATEWAY_ERROR', error: String(err?.message ?? err) }));
+  }
+});
+
+server.listen(PORT, () => {
+  console.log('[gateway] listening on :' + PORT + ' -> the only place bookFlight() runs.');
+  console.log('[gateway] every request is independently re-verified against this agent\\'s own policy.');
+});
+`;
+}
+
+function gatewayPackageJson(slug) {
+  return JSON.stringify(
+    {
+      name: slug + '-gateway',
+      version: '0.1.0',
+      private: true,
+      type: 'module',
+      scripts: { start: 'node server.mjs' },
+      dependencies: { [MCP_GUARD_PKG]: MCP_GUARD_VERSION, [GATEWAY_PKG]: GATEWAY_VERSION },
+    },
+    null,
+    2,
+  ) + '\n';
+}
+
+function gatewayEnvExample() {
+  return `# Real tool credentials belong HERE, read from process.env in server.mjs — never in the
+# agent process one directory up.
+# AIRLINE_API_KEY=
+`;
+}
+
+function gatewayGitignore() {
+  return `node_modules/\n.env\n`;
+}
+
+function gatewayReadme(slug, scope, port) {
+  return `# ${slug}-gateway
+
+**With MetaMynd, you can't be bypassed.** This process is why. It is the **real enforcement
+boundary** for \`${slug}\`'s tool(s) — not \`../index.mjs\`. See
+[What this closes, precisely](#what-this-closes-precisely) below for exactly what that covers.
+
+## Why this exists
+
+\`guard.guardTool()\` in the agent's \`index.mjs\` is a client-side convenience: it gives fast,
+local ALLOW/BLOCK/ESCALATE feedback, but it still runs its handler in the SAME process
+regardless of where that decision came from. Anything able to call the agent's tool function
+directly — a bug, a compromised dependency, a dishonest fork of the agent's own code — gets the
+same result the gate would have given it. That is not a defect in \`guardTool()\`; a cooperative
+in-process check has no counterparty to disagree with a caller that skips it. See \`--harness\`'s
+own README for the same structural point in the free local-demo mode.
+
+This process closes that gap by being a **separate** one. The agent has no way to reach into it
+and call \`bookFlight()\` directly, because \`bookFlight()\` doesn't exist in the agent's process —
+it exists only here, and every request that reaches it has already been independently
+re-verified against this agent's OWN published policy bundle, fetched over the network by THIS
+process, not trusted from the agent's say-so — AND bound to the actual body being executed
+(payload binding) AND to a real, single-use, stateful authorization (\`requireAuthorization\`) —
+see below for what each of those means precisely.
+
+## Run
+
+\`\`\`bash
+npm install
+npm start
+\`\`\`
+
+Listens on \`:${port}\` by default (\`PORT\` env var to change it — keep \`../index.mjs\`'s
+\`GATEWAY_URL\` in sync if you do).
+
+## Add real credentials
+
+Edit \`server.mjs\`'s \`bookFlight()\` with your real implementation, reading any credentials it
+needs from \`process.env\` (see \`.env.example\`). Load \`.env\` however you prefer (e.g.
+\`node --env-file=.env server.mjs\`, Node ≥ 20.6) — it is already in \`.gitignore\`. The agent
+directory one level up must never hold these credentials; if it needs to call a DIFFERENT tool,
+add another protected route here rather than adding a local function back in \`index.mjs\`.
+
+## Files
+
+- \`server.mjs\` — the gateway: one protected route (\`POST /book-flight\`, action \`${scope}\`),
+  \`@metamynd/agentsafe-mcp-guard\`'s \`verifyRequest()\` re-checking every request, and the real
+  \`bookFlight()\`.
+- \`.env.example\` — where real tool credentials go (copy to \`.env\`, fill in, never commit).
+
+## What this closes, precisely
+
+Four independent checks, each closing a different bypass an agent (or anything able to call its
+own code, or a network attacker) might attempt:
+
+- **Direct call.** \`bookFlight()\` doesn't exist in the agent's process. There's nothing to call.
+- **Confused deputy (payload).** The gateway re-verifies the signed request against this agent's
+  own policy AND binds it to the actual request body (payload binding,
+  \`@metamynd/agentsafe-http-gateway\` ≥ 0.4.0) — signing a cheap request while executing an
+  expensive one is refused before the tool ever runs. The default binder requires \`amount\`/
+  \`merchant\` to actually be found in the body whenever the signature names a real value for
+  them — not just "did the body offer at least one correct-looking field." A first attempt at
+  this (0.3.0) checked the weaker version and was re-tested and closed the same day: a correct
+  decoy in one field let the OTHER field hide anywhere — nested, renamed, an array, or an
+  entirely empty/non-JSON body.
+- **Replay.** \`requireAuthorization: true\` (set in \`server.mjs\`) requires the agent's
+  \`authorizationId\` — from a REAL \`guard.authorize()\` call, which \`index.mjs\` already makes for
+  any value-bearing action by default — to atomically claim single-use execution against the
+  issuer. A captured, replayed request fails the claim the second time.
+- **Cumulative spend.** The same \`authorizationId\` only exists because the real stateful gate
+  already checked it against the mandate's TOTAL budget when it was minted — not just this one
+  request's amount. Many small legal-looking calls can't add up past the mandate cap this way,
+  because each needed its own real authorization first.
+- **Amount unknown.** \`amount-unknown\` (\`@metamynd/agentsafe-mcp-guard\` ≥ 0.3.0) blocks a
+  platform tool by default when its raw bytes or a nested payload hide the amount from a naive
+  spend cap — AND this agent's OWN starter SOP (see \`agent.metamynd.json\` /
+  \`harness-rules.json\`) puts the same check ahead of its per-transaction cap. That second part
+  didn't used to be true: the SOP only ever authored \`amount-over\`, which silently does not fire
+  on a missing or string amount, so either one slipped the cap untested — the atom existing
+  wasn't the gap, this template never authoring it was.
+
+The claim above also checks the claimed authorization's own \`agentDid\`/\`amount\`/\`currency\`/
+\`merchant\` against the request actually being executed (\`@metamynd/agentsafe-mcp-guard\` ≥ 0.2.1)
+— a same-amount, same-currency authorization legitimately obtained for one merchant cannot unlock
+a booking with a different one; that gap was found while building this and closed, not left open.
+See \`@metamynd/agentsafe-mcp-guard\`'s own README (\`requireAuthorization\`) for the full mechanism,
+and \`demo/duffel-mcp-gateway\` in the AgentSafe repo for the fuller pattern this is a slice of
+(mutual DID handshake, x402 payment binding, commitment-bound capability tokens).
+`;
+}
+
+function writeFileSafe(dir, name, content, force = false) {
+  const p = join(dir, name);
+  const exists = existsSync(p);
+  if (exists && !force) { console.log(`  ${c.yellow('skip')}  ${name} ${c.dim('(exists)')}`); return; }
+  writeFileSync(p, content);
+  console.log(`  ${exists ? c.yellow('overwrite') : c.green('create')} ${name}`);
+}
+
+/**
+ * Refuse to scaffold into a non-empty directory unless --force.
+ *
+ * Silently skipping an existing agent.metamynd.json is worse than it sounds:
+ * provisioning has already minted a NEW agent server-side, so the scaffold prints
+ * success while leaving the OLD config in place. Every later gate call then runs as
+ * the previous identity, against whatever apiBase that file happens to carry — which
+ * is exactly how a stale http:// base survived a re-scaffold and 404'd every call.
+ */
+function assertScaffoldTarget(outDir, force) {
+  if (force || !existsSync(outDir)) return;
+  const entries = readdirSync(outDir);
+  if (entries.length === 0) return;
+  const rel = outDir.replace(resolve('.'), '.').replace(/\\/g, '/');
+  fail(
+    `${rel} is not empty (${entries.length} item${entries.length === 1 ? '' : 's'}).\n\n` +
+      `  Scaffolding here would KEEP the existing files — including any agent.metamynd.json —\n` +
+      `  so this project would keep running as the identity in that file, against the apiBase\n` +
+      `  in that file, and the newly provisioned agent would go unused.\n\n` +
+      `  Scaffold somewhere new:        --out ./another-dir\n` +
+      `  or overwrite this one on purpose: --force`,
+  );
+}
+
+/**
+ * Write the scaffolded project + print next steps. Shared by the provision and sandbox paths.
+ * `withGateway`: scaffold the default two-process shape (agent + ./gateway) — the real
+ * enforcement boundary. Off for --sandbox (shared demo identity, never real credentials
+ * anyway) and --no-gateway (opt out, e.g. you're already running your own separate gateway).
+ */
+function scaffoldProject({ outDir, config, slug, scope, perTxnMax, sandbox, withGateway, gatewayPort = DEFAULT_GATEWAY_PORT, force = false }) {
+  assertScaffoldTarget(outDir, force);
+  console.log(`\n  ${c.b('Scaffolding')} ${c.dim(outDir)}`);
+  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+  writeFileSafe(outDir, 'agent.metamynd.json', JSON.stringify(config, null, 2) + '\n', force);
+  writeFileSafe(outDir, 'index.mjs', withGateway ? exampleIndex(scope, perTxnMax, gatewayPort) : exampleIndexNoGateway(scope, perTxnMax), force);
+  writeFileSafe(outDir, 'package.json', examplePackageJson(slug), force);
+  writeFileSafe(outDir, '.gitignore', gitignore(), force);
+  writeFileSafe(outDir, 'README.md', exampleReadme(slug, scope, withGateway, gatewayPort), force);
+
+  if (withGateway) {
+    const apiBase = config.apiBase ?? config.api ?? DEFAULT_API;
+    const gwDir = join(outDir, 'gateway');
+    if (!existsSync(gwDir)) mkdirSync(gwDir, { recursive: true });
+    writeFileSafe(gwDir, 'server.mjs', gatewayServerFile(scope, gatewayPort, apiBase), force);
+    writeFileSafe(gwDir, 'package.json', gatewayPackageJson(slug), force);
+    writeFileSafe(gwDir, '.env.example', gatewayEnvExample(), force);
+    writeFileSafe(gwDir, '.gitignore', gatewayGitignore(), force);
+    writeFileSafe(gwDir, 'README.md', gatewayReadme(slug, scope, gatewayPort), force);
+  }
+
+  const rel = outDir.replace(resolve('.'), '.').replace(/\\/g, '/');
+  console.log(`\n${c.green(c.b('  ✓ Done.'))} Your governed agent is ready.\n`);
+  if (sandbox) {
+    console.log(`  ${c.dim('Shared sandbox agent — for trying MetaMynd only. Provision your own (drop --sandbox) for anything real.')}\n`);
+  } else if (config.agentKey) {
+    console.log(`  ${c.yellow('⚠ agent.metamynd.json holds the agent secret key')} — it is gitignored; never commit it.\n`);
+  }
+  if (withGateway) {
+    console.log(`  ${c.yellow('⚠ two processes now')} — \`gateway/\` is the real enforcement boundary, not \`index.mjs\`. Read \`gateway/README.md\`.\n`);
+  }
+  console.log(`  Next:`);
+  if (withGateway) {
+    console.log(c.cyan(`    cd ${rel}/gateway && npm install && npm start`) + c.dim('   (separate terminal — start this first)'));
+  }
+  console.log(c.cyan(`    cd ${rel}`));
+  console.log(c.cyan(`    npm install`));
+  // The example runs FOUR attempts. This summary promised three, so the one carrying the
+  // whole argument — the agent asking to raise its own limit — arrived unannounced.
+  console.log(c.cyan(`    npm start`) + c.dim('   → ALLOW · BLOCK (over cap) · ESCALATE (high risk)'));
+  console.log(c.dim('                 · BLOCK (the agent asking to raise its OWN limit)\n'));
+  console.log(c.cyan(`    npm test`) + c.dim('    → assert it CANNOT exceed its mandate. Put this in CI.\n'));
+  console.log(c.dim(`  Change the rules any time in the dashboard (Legal Entity → SOPs) — no redeploy.\n`));
+}
+
+/** --sandbox: no login, no KYB — fetch the shared sandbox agent config and scaffold. */
+async function runSandbox(args) {
+  const apiRaw = (typeof args.api === 'string' ? args.api : undefined) ?? process.env.METAMYND_API ?? DEFAULT_API;
+  const base = String(apiRaw).replace(/\/+$/, '');
+  // Check the target BEFORE provisioning: refusing afterwards would mint an agent
+  // server-side and then throw it away.
+  const outDir = resolve(String(args.out || './metamynd-sandbox'));
+  assertScaffoldTarget(outDir, !!args.force);
+  console.log(c.dim(`  → requesting a sandbox agent from ${base} …`));
+  const provisioned = await apiPost(base, '/onboarding/sandbox', {}, null);
+  const config = provisioned?.data;
+  if (!config?.agentDid) fail('Sandbox did not return a config with an agentDid.');
+  console.log(`  ${c.green('✓')} sandbox agent ${c.b(config.agentDid)} ${c.dim('(shared test identity)')}`);
+  const scope = config.mandate?.scope || 'flight-purchase';
+  const perTxnMax = Number(config.perTxnMax) || 500;
+  scaffoldProject({ outDir, config, slug: 'metamynd-sandbox', scope, perTxnMax, sandbox: true, withGateway: false, force: !!args.force });
+}
+
+// ---------- --harness: a free, local, zero-network governance harness ----------
+//
+// Not the hosted platform, and not trying to be. `guardToolLocal()` + `evaluateLocally()`
+// (agentsafe-guard.mjs) already decide allow/block/escalate with NO network call, given
+// {standards, sops, mandate} as plain objects — this mode is just the missing packaging:
+// author those objects locally instead of fetching a signed bundle from a backend, add
+// somewhere for a human to approve an escalate, and a page to see any of it.
+//
+// What you get: real gating, on your own machine, your own rules, no account.
+// What you don't: anchored/verifiable identity, cross-party trust, evidence anyone but you
+// can audit, a dashboard reachable when your machine is off. That gap is the paid platform —
+// and it's a config change to cross, not a rewrite: point `bundleUrl` at a real MAGP_API
+// (or re-provision with `create-metamynd-agent`, no --harness) and the SAME guardTool() calls
+// keep working, sealed by a real gate instead of a rules file you authored yourself.
+
+/** Mirrors defaultSopDocument() in backend/src/features/onboarding/onboarding.provision.ts —
+ *  same starter rules the hosted platform issues, so a harness project behaves identically
+ *  to a freshly-provisioned one before anyone edits either.
+ *
+ *  `amount-unknown` first matters MORE here than on the hosted path: evaluateLocally() runs
+ *  entirely client-side with no schema boundary in front of it, so nothing stops a caller from
+ *  passing amount: "5000" (a string) or omitting amount entirely — `amount-over` silently does
+ *  not fire on either (`typeof c.amount === 'number'` is false), so the cap passes untested,
+ *  not safe. Ordering amount-unknown first blocks that instead of letting it through. */
+function harnessDefaultSop(perTxnMax) {
+  return {
+    molecules: [
+      { id: 'amount-known', name: 'Amount must be determinable', combinator: 'any', atoms: [{ id: 'a0', predicate: 'amount-unknown' }], decision: 'block', reasonCode: 'AMOUNT_NOT_DETERMINABLE' },
+      { id: 'cap', name: 'Per-transaction cap', combinator: 'any', atoms: [{ id: 'a1', predicate: 'amount-over', config: { limit: perTxnMax } }], decision: 'block', reasonCode: 'SOP_SPEND_CAP' },
+      { id: 'review', name: 'High-risk review', combinator: 'any', atoms: [{ id: 'a2', predicate: 'risk-at-or-above', config: { level: 'high' } }], decision: 'escalate', reasonCode: 'RISK_REVIEW' },
+    ],
+  };
+}
+
+/** Mirrors issueMandate()'s document shape in backend/src/features/policy/mandate/mandate.service.ts
+ *  (minus the parts only a real principal/issuer can do: no VC, no Hedera anchor, no signature) —
+ *  same shape evaluateMandate() in policy-core.mjs expects either way. */
+function harnessMandate({ scope, currency, maxAmount, perTxnMax, merchants }) {
+  return {
+    uid: `urn:metamynd:mandate:local-${crypto.randomUUID()}`,
+    profile: 'https://metamynd.ai/odrl/agent-mandate/v1',
+    validFrom: new Date().toISOString(),
+    validUntil: null,
+    permission: [
+      {
+        target: scope,
+        action: 'execute',
+        constraint: [
+          { leftOperand: 'mm:payAmount', operator: 'lteq', rightOperand: perTxnMax, unit: currency },
+          { leftOperand: 'mm:cumulativeSpend', operator: 'lteq', rightOperand: maxAmount, unit: currency },
+          ...(merchants?.length ? [{ leftOperand: 'mm:merchant', operator: 'isAnyOf', rightOperand: merchants }] : []),
+        ],
+      },
+    ],
+  };
+}
+
+/** A clearly-local, clearly-not-anchored identifier — `guard.agentDid` is just a signing
+ *  subject in the local path (never resolved against Hedera), but the format should not
+ *  read as a verified did:hedera when it is not one. */
+function harnessAgentDid(publicKeyHex) {
+  return `did:key:local-${crypto.createHash('sha256').update(publicKeyHex, 'hex').digest('hex').slice(0, 32)}`;
+}
+
+function harnessRulesFile(mandate, sopDocument) {
+  return JSON.stringify(
+    {
+      _comment: 'Your rules — edit here, or at the dashboard below. Reloaded on every decision, no restart needed.',
+      mandate,
+      sops: [{ standardKey: 'sop', document: sopDocument }],
+      standards: [],
+    },
+    null,
+    2,
+  ) + '\n';
+}
+
+function harnessServerFile() {
+  return `// harness-server.mjs — the free local governance dashboard. Zero dependencies.
+// Runs in-process with your agent: shows the rules in force, lets you add/edit/remove SOP
+// rules without hand-editing JSON, holds an escalated action for YOU to approve (there is no
+// hosted owner queue here — you are the owner), and logs every decision. Bound to 127.0.0.1
+// by default: this is a local trust boundary, not a service.
+import http from 'node:http';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, writeFileSync as wf } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+// The SAME atom catalog + validator the hosted platform's rule builder uses — so the add-rule
+// form's predicate list, field types and validation never drift from what the gate accepts.
+import { ATOM_SPECS, validateMolecules } from '${GUARD_PKG}/policy-core';
+
+const OPERATORS = { lteq: '<=', gteq: '>=', lt: '<', gt: '>', eq: '==', neq: '!=', isAnyOf: 'is any of', isNoneOf: 'is none of' };
+function renderConstraint(c) {
+  const op = OPERATORS[c.operator] || c.operator;
+  const right = Array.isArray(c.rightOperand) ? \`[\${c.rightOperand.join(', ')}]\` : c.rightOperand;
+  return \`\${String(c.leftOperand).replace(/^mm:/, '')} \${op} \${right}\${c.unit ? ' ' + c.unit : ''}\`;
+}
+function renderAtom(a) {
+  const c = a.config || {};
+  switch (a.predicate) {
+    case 'amount-unknown': return \`transaction amount must be a real, determinable number\`;
+    case 'amount-over': return \`transaction amount must not exceed \${c.limit}\`;
+    case 'cumulative-over': return \`cumulative spend must not exceed \${c.limit}\`;
+    case 'jurisdiction-not-allowed': return \`jurisdiction must be one of [\${(c.allowed || []).join(', ')}]\`;
+    case 'tool-not-allowed': return \`tool must be one of [\${(c.allowed || []).join(', ')}]\`;
+    case 'risk-at-or-above': return \`risk level at or above \${c.level}\`;
+    default: return \`\${a.predicate}\${Object.keys(c).length ? ' ' + JSON.stringify(c) : ''}\`;
+  }
+}
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// A field's declared type (from ATOM_SPECS) coerces a raw form string authoritatively —
+// no guessing, unlike the generic value-edit coerce() below.
+function coerceField(raw, type) {
+  if (type === 'number') return Number(raw);
+  if (type === 'string[]') return String(raw).split(',').map((s) => s.trim()).filter(Boolean);
+  return raw; // string, enum
+}
+
+export function startDashboard({ port = 4400, host = '127.0.0.1', agentDid, scope, rulesPath, logPath }) {
+  const holds = new Map(); // id -> { id, action, args, decision, ts, status, resolve }
+  if (!existsSync(logPath)) wf(logPath, '');
+
+  function log(entry) {
+    try { appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\\n'); } catch { /* best-effort */ }
+  }
+  function tailLog(n = 25) {
+    try {
+      const lines = readFileSync(logPath, 'utf8').split('\\n').filter(Boolean);
+      return lines.slice(-n).reverse().map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    } catch { return []; }
+  }
+  function readRules() {
+    try { return JSON.parse(readFileSync(rulesPath, 'utf8')); } catch (e) { return { error: String(e?.message ?? e) }; }
+  }
+  function writeRules(next) {
+    writeFileSync(rulesPath, JSON.stringify(next, null, 2) + '\\n');
+  }
+
+  /** Called by your agent code when a governed action escalates. Registers the hold (visible
+   *  on the dashboard immediately) and returns { id, promise } — promise resolves to
+   *  true/false the moment a human clicks Approve/Deny here. Nothing times this out; a caller
+   *  that wants a demo-friendly timeout should race the promise itself. */
+  function holdForApproval(action, args, decision) {
+    const id = randomUUID();
+    log({ type: 'escalate', id, action, args, reasonCode: decision.reasonCode });
+    let resolveFn;
+    const promise = new Promise((resolve) => { resolveFn = resolve; });
+    holds.set(id, { id, action, args, decision, ts: Date.now(), status: 'pending', resolve: resolveFn });
+    return { id, promise };
+  }
+
+  function logDecision(action, args, decision) {
+    if (decision.decision === 'escalate') return; // holdForApproval already logs this one
+    log({ type: decision.decision, action, args, reasonCode: decision.reasonCode });
+  }
+
+  function renderRulesHtml(rules) {
+    if (rules.error) return \`<p class="err">Could not read \${esc(rulesPath)}: \${esc(rules.error)}</p>\`;
+    const m = (rules.mandate?.permission || [])[0];
+    const mandateRows = (m?.constraint || []).map((c, i) =>
+      \`<div class="rule"><span class="rname">\${esc(c.leftOperand.replace(/^mm:/, ''))}</span><span class="rcond">\${esc(renderConstraint(c))}</span>
+       <input data-kind="mandate" data-idx="\${i}" value="\${esc(Array.isArray(c.rightOperand) ? c.rightOperand.join(',') : c.rightOperand)}" /></div>\`).join('');
+    // Grouped by molecule (one "rule" a person authored), not flattened — a molecule can have
+    // several atoms/config fields, and the delete button acts on the whole rule, not one field.
+    const sopGroups = (rules.sops || []).flatMap((s) => (s.document?.molecules || []).map((mo) => {
+      const fieldRows = (mo.atoms || []).flatMap((a) => Object.entries(a.config || {}).map(([k, v]) =>
+        \`<div class="rule"><span class="rcond">\${esc(renderAtom(a))}</span>
+         <input data-kind="atom" data-mid="\${esc(mo.id)}" data-aid="\${esc(a.id)}" data-key="\${esc(k)}" value="\${esc(Array.isArray(v) ? v.join(',') : v)}" /></div>\`)).join('');
+      return \`<div class="mgroup">
+        <div class="mhead"><span class="rname">\${esc(mo.name || mo.id)}</span>
+          <span class="reff">\${esc(mo.decision)} · \${esc(mo.reasonCode)}</span>
+          <button class="delmol" data-id="\${esc(mo.id)}" title="Remove this rule">Delete</button></div>
+        \${fieldRows}
+      </div>\`;
+    })).join('');
+    return \`<div class="rules">\${mandateRows}</div>\${sopGroups}<button id="save">Save changes</button><span id="saveMsg"></span>
+<div id="addRule">
+  <h3>Add a rule</h3>
+  <div class="addrow">
+    <label>When <select id="addPredicate"></select></label>
+    <label>Then <select id="addDecision">
+      <option value="block">block</option><option value="escalate">escalate</option>
+      <option value="observe">observe</option><option value="suspend">suspend</option>
+      <option value="quarantine">quarantine</option>
+    </select></label>
+  </div>
+  <p class="dim" id="addDesc"></p>
+  <div id="addFields"></div>
+  <div class="addrow">
+    <label>Name <input id="addName" placeholder="(optional)" /></label>
+    <label>Reason code <input id="addReasonCode" placeholder="(auto)" /></label>
+  </div>
+  <button id="addRuleBtn">Add rule</button><span id="addMsg"></span>
+</div>\`;
+  }
+
+  function renderHoldsHtml() {
+    const pending = [...holds.values()].filter((h) => h.status === 'pending').sort((a, b) => a.ts - b.ts);
+    if (!pending.length) return '<p class="dim">No pending approvals.</p>';
+    return pending.map((h) =>
+      \`<div class="hold"><b>\${esc(h.action)}</b> <span class="dim">\${esc(h.decision.reasonCode)}</span>
+       <pre>\${esc(JSON.stringify(h.args, null, 2))}</pre>
+       <button class="approve" data-id="\${h.id}">Approve</button>
+       <button class="deny" data-id="\${h.id}">Deny</button></div>\`).join('');
+  }
+
+  function renderLogHtml() {
+    const rows = tailLog(25);
+    if (!rows.length) return '<p class="dim">No decisions yet — run your agent.</p>';
+    return rows.map((r) =>
+      \`<div class="logrow \${esc(r.type)}"><span class="dot"></span><b>\${esc(r.action)}</b> \${esc(r.type)} <span class="dim">\${esc(r.reasonCode || '')} · \${esc(r.ts)}</span></div>\`).join('');
+  }
+
+  function page() {
+    const rules = readRules();
+    return \`<!doctype html><html><head><meta charset="utf-8"><title>MetaMynd harness — \${esc(scope)}</title>
+<style>
+  * { box-sizing: border-box; } body { margin:0; background:#f5f4f8; color:#1a1a2e; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:16px 22px; border-bottom:1px solid #e2e0eb; background:#fff; }
+  header h1 { font-size:16px; margin:0 0 4px; } header .did { font:11px ui-monospace,monospace; color:#6b6b80; }
+  main { max-width:760px; margin:0 auto; padding:20px; }
+  section { background:#fff; border:1px solid #e2e0eb; border-radius:10px; padding:14px 16px; margin-bottom:16px; }
+  section h2 { font-size:13px; margin:0 0 10px; color:#6b6b80; text-transform:uppercase; letter-spacing:.04em; }
+  .rule { display:flex; align-items:center; gap:10px; padding:6px 0; border-top:1px solid #eeecf3; flex-wrap:wrap; }
+  .rule:first-child { border-top:none; } .rname { font-weight:600; } .reff { font-weight:400; color:#6b6b80; font-size:11px; }
+  .rcond { font:12px ui-monospace,monospace; color:#6b6b80; flex:1; }
+  .rule input { font:12px ui-monospace,monospace; border:1px solid #d8d5e6; border-radius:6px; padding:4px 8px; width:140px; }
+  .mgroup { border-top:1px solid #eeecf3; padding:8px 0; }
+  .mhead { display:flex; align-items:center; gap:10px; margin-bottom:2px; }
+  .mhead .rname { min-width:150px; }
+  button { font:inherit; cursor:pointer; border:none; border-radius:8px; padding:8px 14px; background:#6c4ff2; color:#fff; font-weight:600; }
+  button.deny, button.delmol { background:#c02532; } button.approve { background:#0f7a43; }
+  button.delmol { padding:4px 10px; font-size:11px; margin-left:auto; }
+  #saveMsg, #addMsg { margin-left:10px; color:#0f7a43; font-size:12px; }
+  #addRule { margin-top:14px; padding-top:14px; border-top:1px solid #eeecf3; }
+  #addRule h3 { font-size:12px; margin:0 0 10px; color:#6b6b80; text-transform:uppercase; letter-spacing:.04em; }
+  .addrow { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:8px; }
+  .addrow label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:#6b6b80; }
+  .addrow input, .addrow select, #addFields input, #addFields select { font:13px inherit; border:1px solid #d8d5e6; border-radius:6px; padding:6px 8px; min-width:160px; }
+  #addFields { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:8px; }
+  #addFields label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:#6b6b80; }
+  #addDesc { font-size:12px; margin:2px 0 10px; }
+  .hold { border:1px solid #f2c46a; background:#fff8ea; border-radius:8px; padding:10px 12px; margin-bottom:8px; }
+  .hold pre { font-size:11px; background:#f5f4f8; padding:8px; border-radius:6px; overflow:auto; }
+  .dim { color:#6b6b80; } pre { margin:6px 0; }
+  .logrow { padding:5px 0; border-top:1px solid #eeecf3; font-size:12px; } .logrow:first-child { border-top:none; }
+  .logrow .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .logrow.allow .dot, .logrow.observe .dot { background:#0f7a43; } .logrow.block .dot { background:#c02532; } .logrow.escalate .dot { background:#c98a1c; }
+  .err { color:#c02532; }
+</style></head><body>
+<header><h1>MetaMynd governance harness</h1><div class="did">\${esc(agentDid)} · scope \${esc(scope)}</div></header>
+<main>
+<section><h2>Rules in force</h2>\${renderRulesHtml(rules)}</section>
+<section><h2>Pending approvals</h2><div id="holds">\${renderHoldsHtml()}</div></section>
+<section><h2>Recent decisions</h2><div id="log">\${renderLogHtml()}</div></section>
+</main>
+<script>
+async function refresh() {
+  const r = await fetch('/state').then((x) => x.json());
+  document.getElementById('holds').innerHTML = r.holdsHtml;
+  document.getElementById('log').innerHTML = r.logHtml;
+}
+
+// --- Add-a-rule form: predicates + field types come from the SAME catalog the gate itself
+// validates against (served at /catalog), so this form can never offer something invalid. ---
+let CATALOG = [];
+function fieldInputHtml(f) {
+  const id = 'af_' + f.key;
+  if (f.type === 'enum') {
+    return '<label>' + f.description + '<select id="' + id + '" data-key="' + f.key + '" data-type="' + f.type + '">' +
+      (f.options || []).map((o) => '<option value="' + o + '">' + o + '</option>').join('') + '</select></label>';
+  }
+  return '<label>' + f.description + (f.type === 'string[]' ? ' (comma-separated)' : '') +
+    '<input id="' + id + '" data-key="' + f.key + '" data-type="' + f.type + '" ' + (f.type === 'number' ? 'type="number"' : '') + ' /></label>';
+}
+function renderAddFields() {
+  const spec = CATALOG.find((s) => s.predicate === document.getElementById('addPredicate').value);
+  document.getElementById('addDesc').textContent = spec ? spec.description : '';
+  document.getElementById('addFields').innerHTML = spec ? spec.config.map(fieldInputHtml).join('') : '';
+}
+fetch('/catalog').then((r) => r.json()).then((specs) => {
+  CATALOG = specs;
+  document.getElementById('addPredicate').innerHTML = specs.map((s) => '<option value="' + s.predicate + '">' + s.label + '</option>').join('');
+  renderAddFields();
+});
+document.getElementById('addPredicate').addEventListener('change', renderAddFields);
+
+document.addEventListener('click', async (e) => {
+  if (e.target.matches('.approve,.deny')) {
+    const id = e.target.dataset.id, verb = e.target.classList.contains('approve') ? 'approve' : 'deny';
+    await fetch('/holds/' + id + '/' + verb, { method: 'POST' });
+    refresh();
+  }
+  if (e.target.id === 'save') {
+    const mandateInputs = [...document.querySelectorAll('input[data-kind="mandate"]')];
+    const atomInputs = [...document.querySelectorAll('input[data-kind="atom"]')];
+    const edits = {
+      mandate: mandateInputs.map((i) => ({ idx: Number(i.dataset.idx), value: i.value })),
+      atoms: atomInputs.map((i) => ({ mid: i.dataset.mid, aid: i.dataset.aid, key: i.dataset.key, value: i.value })),
+    };
+    const res = await fetch('/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edits) });
+    document.getElementById('saveMsg').textContent = res.ok ? 'saved — takes effect on the next decision' : 'save failed';
+  }
+  if (e.target.matches('.delmol')) {
+    if (!confirm('Remove this rule?')) return;
+    const res = await fetch('/rules/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: e.target.dataset.id }) });
+    if (res.ok) location.reload(); else document.getElementById('saveMsg').textContent = 'delete failed';
+  }
+  if (e.target.id === 'addRuleBtn') {
+    const predicate = document.getElementById('addPredicate').value;
+    const config = {};
+    for (const el of document.querySelectorAll('#addFields [data-key]')) config[el.dataset.key] = el.value;
+    const body = {
+      predicate, config,
+      decision: document.getElementById('addDecision').value,
+      name: document.getElementById('addName').value || undefined,
+      reasonCode: document.getElementById('addReasonCode').value || undefined,
+    };
+    const res = await fetch('/rules/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await res.json();
+    if (res.ok) location.reload();
+    else document.getElementById('addMsg').textContent = r.error || 'could not add rule';
+  }
+});
+setInterval(refresh, 3000);
+</script></body></html>\`;
+  }
+
+  // A number-looking string edit becomes a number (spend caps etc.); a comma-list becomes an
+  // array (merchants/allow-lists); anything else stays a string.
+  function coerce(raw) {
+    if (raw.includes(',')) return raw.split(',').map((s) => s.trim()).filter(Boolean);
+    if (raw.trim() !== '' && !Number.isNaN(Number(raw))) return Number(raw);
+    return raw;
+  }
+
+  function applyEdits(rules, edits) {
+    const m = (rules.mandate?.permission || [])[0];
+    for (const e of edits.mandate || []) {
+      if (m?.constraint?.[e.idx]) m.constraint[e.idx].rightOperand = coerce(e.value);
+    }
+    for (const e of edits.atoms || []) {
+      for (const s of rules.sops || []) {
+        const mol = (s.document?.molecules || []).find((x) => x.id === e.mid);
+        const atom = mol?.atoms?.find((a) => a.id === e.aid);
+        if (atom) atom.config[e.key] = coerce(e.value);
+      }
+    }
+    return rules;
+  }
+
+  /** Builds one molecule from the add-rule form, validates it with the SAME validator the
+   *  hosted platform runs, and appends it to the first SOP document (there is exactly one in
+   *  a harness project). Single-atom, combinator "all" — the same "sugar" shape --config's
+   *  "rules" array compiles to, so a harness rules file and a --config file stay interchangeable. */
+  function addRule({ predicate, config, decision, name, reasonCode }) {
+    const spec = ATOM_SPECS.find((s) => s.predicate === predicate);
+    if (!spec) return { ok: false, error: \`unknown predicate "\${predicate}"\` };
+    const cfg = {};
+    for (const f of spec.config) {
+      const raw = config?.[f.key];
+      if (raw === undefined || raw === '') { if (f.required) return { ok: false, error: \`"\${f.description}" is required\` }; continue; }
+      cfg[f.key] = coerceField(raw, f.type);
+    }
+    const molecule = {
+      id: \`\${predicate}-\${Date.now().toString(36)}\`,
+      name: name || spec.label,
+      combinator: 'all',
+      atoms: [{ id: 'a1', predicate, config: cfg }],
+      decision,
+      reasonCode: reasonCode || \`\${predicate.toUpperCase().replace(/-/g, '_')}_\${String(decision).toUpperCase()}\`,
+    };
+    const check = validateMolecules([molecule]);
+    if (!check.ok) return { ok: false, error: check.issues.map((i) => i.message).join('; ') };
+    const rules = readRules();
+    if (rules.error) return { ok: false, error: rules.error };
+    if (!rules.sops?.[0]) rules.sops = [{ standardKey: 'sop', document: { molecules: [] } }];
+    rules.sops[0].document.molecules = [...(rules.sops[0].document.molecules || []), molecule];
+    writeRules(rules);
+    log({ type: 'rule-added', id: molecule.id, predicate, decision });
+    return { ok: true, molecule };
+  }
+
+  function deleteRule(id) {
+    const rules = readRules();
+    if (rules.error) return { ok: false, error: rules.error };
+    for (const s of rules.sops || []) {
+      if (!s.document?.molecules) continue;
+      s.document.molecules = s.document.molecules.filter((mo) => mo.id !== id);
+    }
+    writeRules(rules);
+    log({ type: 'rule-deleted', id });
+    return { ok: true };
+  }
+
+  const server = http.createServer(async (req, res) => {
+    const path = req.url.split('?')[0];
+    const send = (status, body, type = 'application/json') => { res.writeHead(status, { 'Content-Type': type }); res.end(type === 'application/json' ? JSON.stringify(body) : body); };
+    if (req.method === 'GET' && path === '/') return send(200, page(), 'text/html; charset=utf-8');
+    if (req.method === 'GET' && path === '/state') return send(200, { holdsHtml: renderHoldsHtml(), logHtml: renderLogHtml() });
+    if (req.method === 'GET' && path === '/catalog') return send(200, ATOM_SPECS);
+    if (req.method === 'POST' && path === '/rules') {
+      let body = ''; req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        try { writeRules(applyEdits(readRules(), JSON.parse(body || '{}'))); return send(200, { ok: true }); }
+        catch (e) { return send(500, { ok: false, error: String(e?.message ?? e) }); }
+      });
+      return;
+    }
+    if (req.method === 'POST' && path === '/rules/add') {
+      let body = ''; req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        try {
+          const r = addRule(JSON.parse(body || '{}'));
+          return send(r.ok ? 200 : 400, r);
+        } catch (e) { return send(500, { ok: false, error: String(e?.message ?? e) }); }
+      });
+      return;
+    }
+    if (req.method === 'POST' && path === '/rules/delete') {
+      let body = ''; req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        try {
+          const { id } = JSON.parse(body || '{}');
+          return send(200, deleteRule(id));
+        } catch (e) { return send(500, { ok: false, error: String(e?.message ?? e) }); }
+      });
+      return;
+    }
+    const m = /^\\/holds\\/([^/]+)\\/(approve|deny)$/.exec(path);
+    if (req.method === 'POST' && m) {
+      const h = holds.get(m[1]);
+      if (h && h.status === 'pending') {
+        h.status = m[2] === 'approve' ? 'approved' : 'denied';
+        log({ type: h.status, id: h.id, action: h.action });
+        h.resolve(h.status === 'approved');
+      }
+      return send(200, { ok: true });
+    }
+    send(404, { error: 'not found' });
+  });
+  server.listen(port, host);
+  return { holdForApproval, logDecision, url: \`http://\${host}:\${port}\`, close: () => server.close() };
+}
+`;
+}
+
+function harnessIndexFile(scope, perTxnMax, port) {
+  const under = Math.max(1, Math.round(perTxnMax * 0.5));
+  const over = Math.round(perTxnMax + 100);
+  return `// index.mjs — your agent, governed entirely on this machine. No account, no network call
+// for a decision: guardToolLocal() decides allow/block/escalate against ./metamynd-rules.json
+// (edit it directly, or at the dashboard). An escalate is held here for YOU to approve —
+// there is no hosted owner queue in this mode, so open the dashboard URL printed below.
+import { readFileSync } from 'node:fs';
+import { createGuard } from '${GUARD_PKG}';
+import { startDashboard } from './harness-server.mjs';
+
+const config = JSON.parse(readFileSync('./agent.metamynd.json', 'utf8'));
+// 'local' as the api: guardToolLocal() never calls it. Kept required-but-unused rather than
+// silently accepting no api at all, so a later switch to a real gate is one field, not a rewrite.
+const guard = createGuard({ api: 'local', agentDid: config.agentDid, agentKey: config.agentKey });
+
+const dashboard = startDashboard({
+  port: ${port},
+  agentDid: config.agentDid,
+  scope: '${scope}',
+  rulesPath: './metamynd-rules.json',
+  logPath: './metamynd-harness.log.jsonl',
+});
+console.log('\\x1b[2m  dashboard: ' + dashboard.url + ' (rules, approvals, decision log)\\x1b[0m\\n');
+
+// Reads the CURRENT rules file fresh every call — editing it (by hand, or at the dashboard)
+// takes effect on the next decision, no restart, matching the "no redeploy" experience the
+// hosted platform gives you.
+const getBundle = () => JSON.parse(readFileSync('./metamynd-rules.json', 'utf8'));
+
+// --- Your real tool. Replace the body with your actual implementation. ---
+async function bookFlight(args) {
+  return { pnr: 'PNR-DEMO', ...args };
+}
+
+// --- The GATED version. Register THIS with your agent instead of the raw handler. ---
+const gatedBookFlight = guard.guardToolLocal(
+  '${scope}',                                   // = your mandate scope
+  bookFlight,
+  (a) => ({                                     // map tool args → gate inputs
+    amount: a.amount,
+    merchant: a.merchant,
+    context: { tool: 'book-flight', riskLevel: a.riskLevel ?? 'low' },
+  }),
+  getBundle,
+);
+
+// --- A tool the agent was NEVER granted. Wrapping it is the demonstration: there is no
+// --- rule anywhere forbidding this. The mandate simply never mentioned the action.
+async function raiseOwnLimit(args) {
+  return { updated: true, ...args };          // never runs, and that is the point
+}
+
+const gatedRaiseOwnLimit = guard.guardToolLocal(
+  'permissions.update',                       // an action NOT in the mandate
+  raiseOwnLimit,
+  (a) => ({ amount: a.amount, merchant: a.merchant, context: { tool: 'permissions-update' } }),
+  getBundle,
+);
+
+const dim = (t) => '\\x1b[2m' + t + '\\x1b[0m';
+const bold = (t) => '\\x1b[1m' + t + '\\x1b[0m';
+const rule = (n) => '  ' + '-'.repeat(n);
+
+const WHY = {
+  AUTHORIZED: 'inside the mandate and under the SOP spend cap',
+  SOP_SPEND_CAP: 'your SOP caps a single transaction at $${perTxnMax}',
+  RISK_REVIEW: 'your SOP sends high-risk actions to a human first',
+  MERCHANT_NOT_ALLOWED: 'the mandate lists which merchants this agent may pay',
+  NO_PERMISSION_FOR_ACTION: 'the mandate never granted this action - at any amount',
+  NO_MANDATE: 'there is no mandate for this action at all',
+};
+
+async function attempt(n, intent, action, args, tool = gatedBookFlight) {
+  console.log('');
+  console.log(bold('  Step ' + n + ' of 4') + ' - ' + intent);
+  console.log(dim('     evaluating locally, no network call...'));
+  try {
+    const r = await tool(args);
+    console.log('\\x1b[32m     ALLOWED\\x1b[0m  your tool ran and returned ' + (r.pnr ?? 'ok'));
+    console.log(dim('     ' + WHY.AUTHORIZED));
+  } catch (e) {
+    const g = e.governance ?? {};
+    const why = WHY[g.reasonCode] ?? e.message;
+    if (g.decision === 'escalate') {
+      console.log('\\x1b[33m     ESCALATED\\x1b[0m  held for you to approve - ' + g.reasonCode);
+      console.log(dim('     ' + why));
+      const { id, promise } = dashboard.holdForApproval(action, args, g);
+      console.log(dim('     open ' + dashboard.url + ' and click Approve/Deny (hold ' + id.slice(0, 8) + '…)'));
+      const timeout = new Promise((r) => setTimeout(() => r('timeout'), 20000));
+      const result = await Promise.race([promise, timeout]);
+      if (result === 'timeout') console.log(dim('     still pending after 20s — this demo will not wait forever; the dashboard will, run it again to check.'));
+      else console.log(dim('     ' + (result ? 'approved.' : 'denied.')));
+    } else {
+      console.log('\\x1b[31m     BLOCKED\\x1b[0m  ' + (g.reasonCode ?? 'refused'));
+      console.log(dim('     ' + why));
+      console.log(dim('     your tool never ran - the gate refused before execution.'));
+    }
+    dashboard.logDecision(action, args, g);
+  }
+}
+
+console.log('');
+console.log(bold('  What this simulation shows'));
+console.log('');
+console.log('  Same idea as the hosted platform, running entirely on this machine: an agent');
+console.log('  should not be the thing that decides what it is allowed to do. Three attempts');
+console.log('  take the SAME code path and produce three different outcomes. The fourth asks');
+console.log('  for something never granted at all - the one a prompt could not have stopped,');
+console.log('  because the decision is not made inside your program, and not on a server either.');
+console.log('');
+console.log(dim('  scope  ${scope}'));
+console.log(dim('  cap    $${perTxnMax} per transaction, from ./metamynd-rules.json'));
+
+console.log('');
+console.log(rule(66));
+await attempt(1, 'a $${under} booking, low risk. Expected to pass.', '${scope}', { amount: ${under}, merchant: 'skyward-air', riskLevel: 'low' });
+await attempt(2, 'a $${over} booking, deliberately over the cap.', '${scope}', { amount: ${over}, merchant: 'skyward-air', riskLevel: 'low' });
+await attempt(3, 'a $${under} booking, but flagged high risk.', '${scope}', { amount: ${under}, merchant: 'skyward-air', riskLevel: 'high' });
+await attempt(4, 'the agent stops booking flights and asks to raise its OWN limit.', 'permissions.update', { amount: 100000, merchant: 'skyward-air' }, gatedRaiseOwnLimit);
+console.log('');
+console.log(rule(66));
+
+console.log('');
+console.log(bold('  What this proved'));
+console.log('');
+console.log(dim('   - one code path, three outcomes, decided with zero network calls.'));
+console.log(dim('   - step 4 needed no rule to stop it. The agent could not widen its own'));
+console.log(dim('     authority, because it cannot name an action nobody delegated to it.'));
+console.log(dim('   - the blocked call never reached your tool at all.'));
+console.log(dim('   - every decision is in ./metamynd-harness.log.jsonl - yours, locally.'));
+console.log('');
+console.log(bold('  Without MetaMynd, you can be bypassed.') + ' bookFlight() above runs in THIS');
+console.log(dim('  process - call it directly instead of gatedBookFlight and nothing stops you.'));
+console.log(dim('  --harness proves your policy logic; it does not enforce it against that.'));
+console.log('');
+console.log('  Edit ./metamynd-rules.json (or the dashboard) and run again - the outcome');
+console.log(dim('  changes. This file does not. That is the point.'));
+console.log('');
+console.log(dim('  Ready for more than one machine, a queue someone else can approve from,'));
+console.log(dim('  anchored evidence, or KYC/KYB-backed identity, AND a separate gateway process'));
+console.log(dim('  that closes the bypass above? That is the hosted platform - drop --harness'));
+console.log(dim('  and provision there; the same guardTool() call keeps working.'));
+console.log('');
+dashboard.close();
+`;
+}
+
+function harnessPackageJson(slug) {
+  return JSON.stringify(
+    {
+      name: slug,
+      version: '0.1.0',
+      private: true,
+      type: 'module',
+      scripts: { start: 'node index.mjs' },
+      dependencies: { [GUARD_PKG]: GUARD_VERSION },
+    },
+    null,
+    2,
+  ) + '\n';
+}
+
+function harnessReadme(slug, scope, port) {
+  return `# ${slug}
+
+A free, local MetaMynd/AgentSafe governance harness — your own rules, your own identity,
+decided entirely on this machine. No account, no network call for a decision.
+
+## Run
+
+\`\`\`bash
+npm install
+npm start
+\`\`\`
+
+You should see an ALLOW, a BLOCK (over the per-transaction cap), an ESCALATE (high risk —
+open the dashboard to approve it), and a BLOCK (an action outside the mandate entirely).
+
+## Files
+
+- \`agent.metamynd.json\` — your local identity (a generated Ed25519 keypair; \`agentDid\` is a
+  local label, not an anchored/verifiable one). **Contains a secret key — never commit it.**
+- \`metamynd-rules.json\` — your rules: the mandate (scope + spend limits) and SOP (extra checks).
+  Edit it directly, or at the dashboard. Reloaded on every decision — no restart.
+- \`metamynd-harness.log.jsonl\` — every decision this agent made, append-only.
+- \`harness-server.mjs\` — the local dashboard (port ${port}): rules, pending approvals, decision log.
+- \`index.mjs\` — wraps a tool with \`guard.guardToolLocal(...)\`; the tool only runs when the
+  LOCAL rules permit it.
+
+## What this is not
+
+**Without MetaMynd, you can be bypassed.** Everything below is why, precisely.
+
+No anchored/verifiable identity, no cross-party trust, no evidence anyone but you can audit,
+no dashboard reachable when this machine is off, no owner queue someone else can approve from.
+That's the hosted platform (\`npx create-metamynd-agent\`, without \`--harness\`) — same
+\`guardTool()\` call, same rules shape, so upgrading later is a config change, not a rewrite.
+
+It is also **not a separate enforcement boundary**. \`guardToolLocal()\` (in \`index.mjs\`) is a
+cooperative library this process embeds — call the tool handler directly instead of the guarded
+one and nothing stops you, because there is no second party in the loop to disagree with you.
+That's structural, not a bug: use this harness to govern your own agent's own honest behavior,
+not as a defense against an agent (or a person) actively trying to get around it. The hosted
+platform's default scaffold doesn't have this gap, because a SEPARATE gateway process re-verifies
+the agent's signed authority for itself instead of trusting that the agent's own guard ran.
+`;
+}
+
+/** --harness: no login, no KYB, no network — author identity + rules locally and scaffold. */
+async function runHarness(args) {
+  const interactive = !args.yes && process.stdin.isTTY;
+  const rl = interactive ? makeRl() : null;
+  const pick = async (flag, prompt, def) => {
+    const fromFlag = typeof args[flag] === 'string' ? args[flag] : undefined;
+    if (fromFlag !== undefined) return fromFlag;
+    if (!interactive) return def;
+    return ask(rl, prompt, def);
+  };
+
+  const fileConfig = typeof args.config === 'string' ? loadConfigFile(args.config) : null;
+  if (fileConfig) console.log(`  ${c.green('✓')} loaded policy config ${c.dim(args.config)}`);
+
+  const name = await pick('name', 'Agent name', fileConfig?.name ?? 'Local Agent');
+  const scope = await pick('scope', 'Mandate scope (governed action)', fileConfig?.scope ?? 'flight-purchase');
+  const perTxnMax = Number(await pick('per-txn-max', 'Per-transaction cap', String(fileConfig?.perTxnMax ?? '500'))) || 500;
+  const maxAmount = Number(await pick('max-amount', 'Total mandate budget', String(fileConfig?.maxAmount ?? '10000'))) || 10000;
+  const currency = (await pick('currency', 'Currency', fileConfig?.currency ?? 'USD')) || 'USD';
+  const merchantsRaw = await pick('merchants', 'Allowed merchants (comma-sep, blank = any)', Array.isArray(fileConfig?.merchants) ? fileConfig.merchants.join(',') : '');
+  const merchants = String(merchantsRaw).split(',').map((s) => s.trim()).filter(Boolean);
+  const port = Number(args.port) || 4400;
+  const slug = slugify(name);
+  const outDir = resolve(String(args.out || (interactive ? await ask(rl, 'Output directory', `./${slug}`) : `./${slug}`)));
+  rl?.close();
+
+  assertScaffoldTarget(outDir, !!args.force);
+  console.log(c.dim('\n  → generating a local identity (Ed25519, this machine only) …'));
+  const { publicKeyHex, privateKeyHex } = generateAgentKeypair();
+  const agentDid = harnessAgentDid(publicKeyHex);
+  console.log(`  ${c.green('✓')} local agent ${c.b(agentDid)}`);
+
+  const sopFields = configFileSopFields(fileConfig);
+  const sopDocument = sopFields.sop ? sopFields.sop.documentJson : harnessDefaultSop(perTxnMax);
+  if (sopFields.sop) console.log(`  ${c.green('✓')} compiled ${sopDocument.molecules.length} rule(s) from the config file`);
+  const mandate = harnessMandate({ scope, currency, maxAmount, perTxnMax, merchants });
+
+  console.log(`\n  ${c.b('Scaffolding')} ${c.dim(outDir)}`);
+  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+  writeFileSafe(outDir, 'agent.metamynd.json', JSON.stringify({ agentDid, agentKey: privateKeyHex, mode: 'harness' }, null, 2) + '\n', !!args.force);
+  writeFileSafe(outDir, 'metamynd-rules.json', harnessRulesFile(mandate, sopDocument), !!args.force);
+  writeFileSafe(outDir, 'harness-server.mjs', harnessServerFile(), !!args.force);
+  writeFileSafe(outDir, 'index.mjs', harnessIndexFile(scope, perTxnMax, port), !!args.force);
+  writeFileSafe(outDir, 'package.json', harnessPackageJson(slug), !!args.force);
+  writeFileSafe(outDir, '.gitignore', gitignore(), !!args.force);
+  writeFileSafe(outDir, 'README.md', harnessReadme(slug, scope, port), !!args.force);
+
+  const rel = outDir.replace(resolve('.'), '.').replace(/\\/g, '/');
+  console.log(`\n${c.green(c.b('  ✓ Done.'))} Your local governance harness is ready.\n`);
+  console.log(`  ${c.dim('Free, local, no account. Not the hosted platform — see README#what-this-is-not.')}\n`);
+  console.log(`  Next:`);
+  console.log(c.cyan(`    cd ${rel}`));
+  console.log(c.cyan(`    npm install`));
+  console.log(c.cyan(`    npm start`) + c.dim('   → ALLOW · BLOCK (over cap) · ESCALATE (approve at the dashboard) · BLOCK (ungranted action)\n'));
+  console.log(c.dim(`  Edit ./metamynd-rules.json any time (by hand, or at http://127.0.0.1:${port}) — no redeploy.\n`));
+}
+
+// ---------- delegated issuance (#6) ----------
+async function apiGet(base, path, { claimToken } = {}) {
+  let res;
+  try {
+    res = await fetch(`${base}${path}`, { headers: { ...(claimToken ? { 'x-claim-token': claimToken } : {}) } });
+  } catch (e) {
+    fail(`Cannot reach ${base}${path} — is the API up? (${e.message})`);
+  }
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { /* non-JSON */ }
+  if (!res.ok) fail(`${path} → HTTP ${res.status}${json?.message ? `: ${json.message}` : ''}`);
+  return json;
+}
+
+// Minimal auth for the request flow (flags/env, interactive fallback) — mirrors main()'s login.
+async function authFlow(args) {
+  const apiRaw = (typeof args.api === 'string' ? args.api : undefined) ?? process.env.METAMYND_API ?? DEFAULT_API;
+  const base = String(apiRaw).replace(/\/+$/, '');
+  const interactive = !args.yes && process.stdin.isTTY;
+  const rl = interactive ? makeRl() : null;
+  let email = (typeof args.email === 'string' ? args.email : undefined) ?? process.env.METAMYND_EMAIL;
+  if (!email && interactive) email = await ask(rl, 'Your email', '');
+  if (!email) { rl?.close(); fail('An email is required (--email or METAMYND_EMAIL).'); }
+  let password = typeof args.password === 'string' ? args.password : process.env.METAMYND_PASSWORD;
+  if (password === undefined) {
+    if (!interactive) { rl?.close(); fail('A password is required (--password or METAMYND_PASSWORD).'); }
+    rl?.pause();
+    password = await askHidden('Password');
+    rl?.resume();
+  }
+  rl?.close();
+  const login = await apiPost(base, '/auth/login', { username: email, password }, null);
+  const token = login?.data?.accessToken;
+  if (!token) fail('Login succeeded but no access token was returned.');
+  return { base, token, email };
+}
+
+const REQUEST_STATE_FILE = 'metamynd-request.json';
+
+// --request: a developer requests an agent for an owner's org (the owner approves in the dashboard).
+// Writes metamynd-request.json (requestId + one-time claim token, and the local private key for --byok)
+// so `--claim` can finish once the owner approves.
+async function runRequest(args) {
+  const owner = (typeof args.owner === 'string' ? args.owner : undefined) ?? process.env.METAMYND_OWNER;
+  if (!owner) fail('--owner <ownerEmail> is required for a delegated request.');
+  const { base, token } = await authFlow(args);
+
+  const name = (typeof args.name === 'string' ? args.name : undefined) ?? 'Delegated Agent';
+  const scope = (typeof args.scope === 'string' ? args.scope : undefined) ?? 'flight-purchase';
+  const perTxnMax = Number(args['per-txn-max']) || 500;
+  let publicKey, generated;
+  if (args.byok) {
+    generated = generateAgentKeypair();
+    publicKey = generated.publicKeyHex;
+    console.log(`  ${c.green('✓')} generated an Ed25519 keypair locally ${c.dim('(private key stays on this machine)')}`);
+  }
+
+  console.log(c.dim(`  → requesting "${name}" for ${owner} …`));
+  const res = await apiPost(base, '/onboarding/requests', { ownerEmail: owner, name, scope, perTxnMax, ...(publicKey ? { publicKey } : {}) }, token);
+  const d = res.data;
+  const state = { api: base, requestId: d.requestId, claimToken: d.claimToken, byok: !!generated, privateKey: generated?.privateKeyHex ?? null, name, scope, perTxnMax };
+  const file = resolve(String(args.out || '.'), REQUEST_STATE_FILE);
+  writeFileSync(file, JSON.stringify(state, null, 2) + '\n');
+
+  console.log(`  ${c.green('✓')} request ${c.b(d.requestId)} submitted — awaiting ${owner}'s approval`);
+  console.log(`  ${c.yellow('⚠ saved the one-time claim token to')} ${file.replace(resolve('.'), '.').replace(/\\/g, '/')} ${c.dim('(secret — do not commit)')}\n`);
+  console.log(`  The owner approves in the dashboard (AgentSafe → Agent Requests). Then run:`);
+  console.log(c.cyan(`    npx create-metamynd-agent --claim --watch\n`));
+}
+
+// --claim: poll for the owner's approval, then scaffold. Reads metamynd-request.json (or flags).
+async function runClaim(args) {
+  const file = resolve(String(args['request-file'] || `./${REQUEST_STATE_FILE}`));
+  const state = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  const base = String((typeof args.api === 'string' ? args.api : undefined) ?? state.api ?? DEFAULT_API).replace(/\/+$/, '');
+  const requestId = (typeof args['request-id'] === 'string' ? args['request-id'] : undefined) ?? state.requestId;
+  const claimToken = (typeof args.token === 'string' ? args.token : undefined) ?? state.claimToken;
+  if (!requestId || !claimToken) fail(`Need a requestId + claim token (--request-id/--token, or a ${REQUEST_STATE_FILE}).`);
+
+  const watch = !!args.watch;
+  let claimed;
+  for (;;) {
+    const res = await apiGet(base, `/onboarding/requests/${encodeURIComponent(requestId)}/claim`, { claimToken });
+    const d = res.data;
+    if (d.status === 'approved') { claimed = d; break; }
+    if (d.status === 'denied' || d.status === 'expired') fail(`Request was ${d.status}.`);
+    if (!watch) {
+      console.log(`  ${c.dim(`request is still ${d.status} — the owner hasn't approved yet. Re-run, or add --watch to poll.`)}`);
+      return;
+    }
+    process.stdout.write(c.dim(`  · ${d.status}, waiting for approval …\r`));
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+
+  const config = claimed.config;
+  if (!config?.agentDid) fail('Approved, but no config was returned.');
+  console.log(`\n  ${c.green('✓')} approved — claimed config for ${c.b(config.agentDid)}`);
+
+  // BYOK: inject the local private key and prove control via the claim token.
+  if (state.byok && state.privateKey && config.challenge) {
+    config.agentKey = state.privateKey;
+    const signature = signChallengeHex(state.privateKey, config.challenge);
+    await apiPost(base, `/onboarding/requests/${encodeURIComponent(requestId)}/verify-key`, { signature, claimToken }, null);
+    config.keyVerified = true;
+    delete config.challenge;
+    console.log(`  ${c.green('✓')} key verified — MetaMynd never saw your private key`);
+  }
+
+  const slug = slugify(state.name || 'metamynd-agent');
+  const outDir = resolve(String(args.out || `./${slug}`));
+  scaffoldProject({ outDir, config, slug, scope: state.scope || config.mandate?.scope || 'flight-purchase', perTxnMax: Number(state.perTxnMax) || 500, sandbox: false, withGateway: !args['no-gateway'], gatewayPort: Number(args['gateway-port']) || DEFAULT_GATEWAY_PORT, force: !!args.force });
+}
+
+// ---------- main ----------
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) { console.log(HELP); return; }
+  if (args.version) {
+    try { console.log(JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version); }
+    catch { console.log('unknown'); }
+    return;
+  }
+
+  console.log(`\n${c.b(c.cyan('  create-metamynd-agent'))}  ${c.dim('— provision a governed agent in ~2 minutes')}\n`);
+
+  // --harness: skip login + provisioning + the network entirely.
+  if (args.harness) { await runHarness(args); return; }
+  // --sandbox: skip login + provisioning entirely.
+  if (args.sandbox) { await runSandbox(args); return; }
+  // Delegated issuance (#6): request an agent for an owner's org / claim it once approved.
+  if (args.request) { await runRequest(args); return; }
+  if (args.claim) { await runClaim(args); return; }
+
+  // --config: a JSON policy file. Its fields become the DEFAULT for each prompt/flag below —
+  // an explicit CLI flag still wins (e.g. `--config base.json --name "Other Bot"`), and
+  // env vars still win over the file for login credentials specifically (never put a
+  // password in a policy file that gets checked into source control).
+  const fileConfig = typeof args.config === 'string' ? loadConfigFile(args.config) : null;
+  if (fileConfig) console.log(`  ${c.green('✓')} loaded policy config ${c.dim(args.config)}`);
+
+  const interactive = !args.yes && process.stdin.isTTY;
+  const rl = interactive ? makeRl() : null;
+  const pick = async (flag, envVar, prompt, def) => {
+    const fromFlag = typeof args[flag] === 'string' ? args[flag] : undefined;
+    const fromEnv = envVar ? process.env[envVar] : undefined;
+    if (fromFlag !== undefined) return fromFlag;
+    if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
+    if (!interactive) return def;
+    return ask(rl, prompt, def);
+  };
+
+  // 1. Connection + login
+  const apiRaw = await pick('api', 'METAMYND_API', 'API base URL', DEFAULT_API);
+  const base = String(apiRaw).replace(/\/+$/, '');
+  const email = await pick('email', 'METAMYND_EMAIL', 'Owner email', '');
+  if (!email) { rl?.close(); fail('An owner email is required (--email or METAMYND_EMAIL).'); }
+  let password = typeof args.password === 'string' ? args.password : process.env.METAMYND_PASSWORD;
+  if (password === undefined) {
+    if (!interactive) { rl?.close(); fail('A password is required in --yes mode (--password or METAMYND_PASSWORD).'); }
+    // Pause the readline interface so it doesn't consume the raw keystrokes.
+    rl?.pause();
+    password = await askHidden('Owner password');
+    rl?.resume();
+  }
+
+  console.log(c.dim(`\n  → logging in to ${base} …`));
+  const login = await apiPost(base, '/auth/login', { username: email, password }, null);
+  const token = login?.data?.accessToken;
+  if (!token) { rl?.close(); fail('Login succeeded but no access token was returned.'); }
+  console.log(`  ${c.green('✓')} authenticated as ${email}`);
+
+  // 2. Agent details — a --config file's fields are the default at every prompt/flag below.
+  const name = await pick('name', null, 'Agent name', fileConfig?.name ?? 'Support Bot');
+  const scope = await pick('scope', null, 'Mandate scope (governed action)', fileConfig?.scope ?? 'flight-purchase');
+  const perTxnMax = Number(await pick('per-txn-max', null, 'Per-transaction cap', String(fileConfig?.perTxnMax ?? '500'))) || 500;
+  const maxAmount = Number(await pick('max-amount', null, 'Total mandate budget', String(fileConfig?.maxAmount ?? '10000'))) || 10000;
+  const currency = (await pick('currency', null, 'Currency', fileConfig?.currency ?? 'USD')) || 'USD';
+  const merchantsRaw = await pick(
+    'merchants', null, 'Allowed merchants (comma-sep, blank = any)',
+    Array.isArray(fileConfig?.merchants) ? fileConfig.merchants.join(',') : '',
+  );
+  const merchants = String(merchantsRaw).split(',').map((s) => s.trim()).filter(Boolean);
+
+  // BYOK: --byok generates a keypair on THIS machine (MetaMynd never sees the private key). An
+  // explicit --public-key means the caller holds the key elsewhere and will prove it themselves.
+  let publicKey = typeof args['public-key'] === 'string' ? args['public-key'] : undefined;
+  let generatedKey = null;
+  if (args.byok && !publicKey) {
+    generatedKey = generateAgentKeypair();
+    publicKey = generatedKey.publicKeyHex;
+    console.log(`  ${c.green('✓')} generated an Ed25519 keypair locally ${c.dim('(private key stays on this machine)')}`);
+  }
+
+  const slug = slugify(name);
+  const outDir = resolve(String(args.out || (interactive ? await ask(rl, 'Output directory', `./${slug}`) : `./${slug}`)));
+
+  rl?.close();
+
+  // 3. Provision (one call) — a --config file's `rules`/`molecules`/`rulePack` become the
+  // starter SOP; with none of those, provisionGuardConfig falls back to its own default
+  // (a per-transaction cap + high-risk review), same as before --config existed.
+  const sopFields = configFileSopFields(fileConfig);
+  if (sopFields.sop) console.log(`  ${c.green('✓')} compiled ${sopFields.sop.documentJson.molecules.length} rule(s) from the config file`);
+  console.log(c.dim(`\n  → provisioning "${name}" (identity + mandate + SOP + Standards) …`));
+  const body = { name, scope, currency, maxAmount, perTxnMax, merchants, ...(publicKey ? { publicKey } : {}), ...sopFields };
+  const provisioned = await apiPost(base, '/onboarding/agent', body, token);
+  const config = provisioned?.data;
+  if (!config?.agentDid) fail('Provisioning did not return a config with an agentDid.');
+  console.log(`  ${c.green('✓')} agent DID ${c.b(config.agentDid)}`);
+  if (config.standards?.length) console.log(`  ${c.green('✓')} enforced Standards: ${config.standards.join(', ')}`);
+
+  // 3b. BYOK: prove control of the key (verify-key), else the gate blocks with AGENT_KEY_UNVERIFIED.
+  if (generatedKey) {
+    // We hold the private key — inject it into the config so the scaffolded guard can sign, and
+    // prove possession by signing the issued challenge.
+    config.agentKey = generatedKey.privateKeyHex;
+    if (config.challenge) {
+      console.log(c.dim('  → proving key control (verify-key) …'));
+      const signature = signChallengeHex(generatedKey.privateKeyHex, config.challenge);
+      await apiPost(base, `/agent-identity/${encodeURIComponent(config.identityId)}/verify-key`, { signature }, token);
+      config.keyVerified = true;
+      delete config.challenge; // one-time; consumed
+      console.log(`  ${c.green('✓')} key verified — MetaMynd never saw your private key`);
+    }
+  } else if (publicKey) {
+    // External BYOK key the CLI can't sign — tell the operator how to finish proving control.
+    console.log(`  ${c.yellow('⚠ bring-your-own-key:')} no managed key minted. Prove control before the gate accepts the agent:`);
+    console.log(c.dim(`      sign this challenge with your private key (Ed25519 over its UTF-8 bytes, hex):`));
+    console.log(c.dim(`      challenge: ${config.challenge ?? '(none returned)'}`));
+    console.log(c.dim(`      POST ${base}/agent-identity/${config.identityId}/verify-key  { "signature": "<hex>" }  (owner token)`));
+  }
+
+  // 4. Scaffold + next steps
+  scaffoldProject({ outDir, config, slug, scope, perTxnMax, sandbox: false, withGateway: !args['no-gateway'], gatewayPort: Number(args['gateway-port']) || DEFAULT_GATEWAY_PORT, force: !!args.force });
+}
+
+main().catch((e) => fail(e?.stack || e?.message || String(e)));
