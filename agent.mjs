@@ -18,9 +18,12 @@ export function newAgent(topic='0.0.9681530'){
 
 // 0.3.3 changed the canonical message: every field is escaped (\\ -> \\\\, | -> \\|) before the
 // join, so a value containing a delimiter can no longer shift the field boundaries.
+// A later release (#663/#664 in the private monorepo) added `resource` as a genuinely signed
+// field, between merchant and nonce — every real request through this suite is resource-less,
+// so it always canonicalizes to the same '' a caller who omits the field gets.
 const escapeField = (v) => String(v).replace(/\\/g, '\\\\').replace(/\|/g, '\\|');
 export const buildAuthMessage = (f) =>
-  [f.agentDid, f.action, f.amount, f.currency, f.merchant ?? '', f.nonce, f.issuedAt].map(escapeField).join('|');
+  [f.agentDid, f.action, f.amount, f.currency, f.merchant ?? '', f.resource ?? '', f.nonce, f.issuedAt].map(escapeField).join('|');
 /** The pre-0.3.3 unescaped canonicalization, kept to probe delimiter injection + version skew. */
 export const buildAuthMessageLegacy = (f) =>
   `${f.agentDid}|${f.action}|${f.amount}|${f.currency}|${f.merchant ?? ''}|${f.nonce}|${f.issuedAt}`;
