@@ -36,7 +36,11 @@ export function sign(agent, { action, amount, currency='USD', merchant, authoriz
     issuedAt: issuedAt ?? new Date().toISOString(),
   };
   const signature = crypto.sign(null, Buffer.from(canon(f),'utf8'), agent.privateKey).toString('hex');
-  return { ...f, signature, ...(authorizationId ? { authorizationId } : {}) };
+  // Since MAGP 6.3 (agentsafe-guard 0.13 / mcp-guard 0.10) a request that states NO riskLevel is escalated
+  // (CONTEXT_UNVERIFIABLE) rather than read as "not risky" — an agent that omits its risk is indistinguishable from
+  // one hiding it. A legitimate agent therefore states an honest one; the attack cases below are unchanged and must
+  // still be refused for their own reasons.
+  return { ...f, signature, itinerary: { riskLevel: 'low' }, ...(authorizationId ? { authorizationId } : {}) };
 }
 
 /** Ask the issuer for a real authorization (the honest path). */
