@@ -29,7 +29,13 @@ const routes = [{ method: 'POST', path: '/book-flight', action: 'book-flight' }]
 // requireAuthorization: true is what closes replay and cumulative spend, not just per-request
 // policy — it requires the agent's authorizationId (from a REAL guard.authorize() call) to
 // atomically claim single-use execution against the issuer before this gateway runs the tool.
-const guard = createMcpGuard({ serviceDid: 'did:local:book-flight-gateway', issuerApi: MAGP_API, requireAuthorization: true });
+//
+// policyPublicKey pins the issuer's policy-signing key (obtained out of band — for the real issuer,
+// GET /magp/policy/pubkey), so a rewritten bundle is refused. Over plain http with no pinned key,
+// mcp-guard >= 0.12 refuses every value-bearing action (POLICY_BUNDLE_UNVERIFIED). The default is
+// mock-issuer.mjs's fixed TEST-ONLY key.
+const POLICY_PUBLIC_KEY = process.env.MAGP_POLICY_PUBLIC_KEY || '8490178fa3028c60d7ec8c0447c64d5b5f6b4328d3df0cee1fa581e419d4ea19';
+const guard = createMcpGuard({ serviceDid: 'did:local:book-flight-gateway', issuerApi: MAGP_API, requireAuthorization: true, policyPublicKey: POLICY_PUBLIC_KEY });
 
 const gateway = createHttpGateway({
   guard,
