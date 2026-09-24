@@ -40,9 +40,10 @@ Three roles run as separate processes, which is the whole point of the threat mo
   runs `matrix.mjs` + `gate.mjs`, tears down, and exits non-zero the moment
   either suite fails
 - `.github/workflows/gate.yml` — runs `run-gate.sh` daily (and on
-  `workflow_dispatch` / a PR touching the harness) against whatever
-  `gateway/package.json`'s `^0.4.0` / `^0.3.0` ranges currently resolve to
-  on the real npm registry — **not** the committed, pinned
+  `workflow_dispatch` / a PR touching the harness) against the `latest`
+  versions `gateway/package.json` names on the real npm registry (not a
+  caret range — on a 0.x version `^` pins the minor, so `^0.3.0` could never
+  reach 0.12) — **not** the committed, pinned
   `gateway/package-lock.json` snapshot below, which stays frozen at the
   2026-08-30 findings on purpose
 - `restart-issuer.sh` — kills the issuer by port (never `pkill -f` — see
@@ -70,7 +71,7 @@ cd agentsafe-cleanroom
 ./restart-issuer.sh                    # or: node mock-issuer.mjs &   (:4402)
 
 # 2. install pinned libs + start the gateway
-cd gateway && npm install              # resolves ^0.4.0 gateway / ^0.3.0 guard
+cd gateway && npm install              # the committed 2026-08-30 lockfile; delete it (+ node_modules) to test `latest`
 node server.mjs &                      # (:4401)
 cd ..
 

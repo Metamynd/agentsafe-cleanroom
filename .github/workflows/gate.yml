@@ -32,8 +32,10 @@ jobs:
       # (0.4.2 / 0.3.3) — a plain `npm install` respects an existing lockfile and would test
       # that snapshot FOREVER, defeating the point of a CONTINUOUS gate. Deleting them here,
       # in this ephemeral CI checkout only, forces npm to re-resolve gateway/package.json's
-      # own `^0.4.0` / `^0.3.0` ranges against whatever is actually latest on the registry
-      # right now. Nothing here is committed back to the repo.
+      # `latest` dist-tags against the registry right now. Nothing here is committed back.
+      # (The ranges used to be `^0.4.0` / `^0.3.0` — and a caret on a 0.x version pins the
+      # MINOR, so this gate kept resolving mcp-guard 0.3.6 / http-gateway 0.4.12 long after
+      # 0.11/0.12 shipped, and failed daily on a signature format those predate.)
       - name: Force fresh resolution against the current published versions
         run: |
           rm -rf gateway/node_modules gateway/package-lock.json
