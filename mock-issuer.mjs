@@ -55,6 +55,11 @@ function unsignedBundle(agentDid) {
               { leftOperand: 'mm:cumulativeSpend',operator: 'lteq',    rightOperand: CUMULATIVE_CAP },
               { leftOperand: 'mm:merchant',       operator: 'isAnyOf', rightOperand: ALLOWED },
             ],
+            // The bypass matrix pays exactly the per-transaction cap ($250 of $250). Since MAGP derived risk
+            // (agentsafe-guard 0.23 / mcp-guard 0.26), a payment at or above 70% of the cap is high risk by
+            // default and goes to review, so this owner opts out of that one signal: the matrix tests bypasses,
+            // not the review threshold. Older guards ignore the field.
+            riskSignals: { amountShare: false },
           }],
         },
       }],
