@@ -35,7 +35,12 @@ const routes = [{ method: 'POST', path: '/book-flight', action: 'book-flight' }]
 // mcp-guard >= 0.12 refuses every value-bearing action (POLICY_BUNDLE_UNVERIFIED). The default is
 // mock-issuer.mjs's fixed TEST-ONLY key.
 const POLICY_PUBLIC_KEY = process.env.MAGP_POLICY_PUBLIC_KEY || '8490178fa3028c60d7ec8c0447c64d5b5f6b4328d3df0cee1fa581e419d4ea19';
-const guard = createMcpGuard({ serviceDid: 'did:local:book-flight-gateway', issuerApi: MAGP_API, requireAuthorization: true, policyPublicKey: POLICY_PUBLIC_KEY });
+//
+// allowedAgents (required since mcp-guard 0.20, MAGP §16.3): which agents this Service acts for. The suite's agents mint a
+// fresh key on every run (agent.mjs newAgent), so they cannot be pinned at startup; 'any' keeps exactly the behaviour every
+// check here was written against — each request judged by its own agent's policy. Admission pinning (AGENT_NOT_ADMITTED,
+// GATEWAY_OWNER_MISMATCH) is covered by the monorepo's own allowed-agents smoke tests, not by this suite.
+const guard = createMcpGuard({ serviceDid: 'did:local:book-flight-gateway', issuerApi: MAGP_API, requireAuthorization: true, policyPublicKey: POLICY_PUBLIC_KEY, allowedAgents: 'any' });
 
 const gateway = createHttpGateway({
   guard,
